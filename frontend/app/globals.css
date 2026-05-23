@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+
+  body {
+    background-color: #0a0a0a;
+    color: #e0e0e0;
+    font-size: 14px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #222222; border-radius: 2px; }
+  ::-webkit-scrollbar-thumb:hover { background: #333333; }
+}
+
+@layer components {
+  .pill {
+    @apply inline-block px-2.5 py-0.5 rounded-full text-xs font-semibold font-mono;
+  }
+  .pill-running {
+    @apply pill border border-[#00c48c] bg-[#00c48c]/10 text-[#00c48c];
+  }
+  .pill-stopped {
+    @apply pill border border-[#222222] bg-[#666666]/10 text-[#666666];
+  }
+  .pill-paused {
+    @apply pill border border-[#f5c518] bg-[#f5c518]/10 text-[#f5c518];
+  }
+  .card {
+    @apply bg-[#111111] border border-[#222222] rounded-lg;
+  }
+  .field-label {
+    @apply block text-[12px] text-[#666666] mb-1;
+  }
+  .field-input {
+    @apply w-full bg-[#0a0a0a] border border-[#222222] rounded text-[#e0e0e0] font-mono text-[13px] px-2.5 py-2 outline-none focus:border-[#f7931a] transition-colors;
+  }
+  .section-title {
+    @apply text-[11px] font-semibold uppercase tracking-widest text-[#666666];
+  }
+}

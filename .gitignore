@@ -1,0 +1,38 @@
+# Go binaries
+glimpse-bot
+/glimpse-bot
+
+# Build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+
+# Go workspace
+go.work
+go.work.sum
+
+# Config with secrets
+config.json
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
