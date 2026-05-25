@@ -1,3 +1,19 @@
+export interface KellyTradeSummary {
+  bin_index: number;
+  range: string;
+  market_pct: number;
+  model_pct: number;
+  edge_pct: number;
+  contracts: number;
+}
+
+export interface KellyLeg {
+  bin_index: number;
+  range: string;
+  contracts: number;
+  edge_pct: number;
+}
+
 export interface BotState {
   running: boolean;
   paused: boolean;
@@ -11,6 +27,11 @@ export interface BotState {
   last_error: string;
   last_trade_time: string;
   recent_logs: string[];
+  // Kelly mode fields
+  model_name?: string;
+  kelly_fraction?: number;
+  misprice_count?: number;
+  kelly_trades?: KellyTradeSummary[];
 }
 
 export interface TradeRecord {
@@ -23,6 +44,7 @@ export interface TradeRecord {
   commission_millisats: number;
   timestamp: string;
   dry_run: boolean;
+  kelly_legs?: KellyLeg[];
 }
 
 export interface MarketSummary {
@@ -51,7 +73,11 @@ export interface StartPayload {
   min_expiry_mins: number;
   max_wallet_pct: number;
   no_duplicates: boolean;
-  forced_option_id: number; // 0 = use strategy
+  forced_option_id: number;
+  // Kelly mode
+  model?: string;
+  sigma_pct?: number;
+  kelly_fraction?: number;
 }
 
 export interface QuickTradePayload {

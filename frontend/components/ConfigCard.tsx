@@ -17,34 +17,35 @@ const STRATEGIES = [
   { value: 'nearest',     label: 'Nearest to Spot',  desc: 'Picks the range containing current BTC price. Safe, mechanical.' },
   { value: 'bestodds',    label: 'Best Odds',         desc: 'Picks the best-value range among the 3 nearest — lowest yes_price while still plausible (recommended).' },
   { value: 'feargreed',   label: 'Fear & Greed',      desc: 'Contrarian: bets bullish when market is fearful, bearish when greedy. Larger offset for extreme readings.' },
-  { value: 'followcrowd', label: 'Follow Crowd',      desc: 'Picks the range with the highest market-implied probability (most expensive = market consensus).' },
+  { value: 'followcrowd', label: 'Follow Crowd',      desc: 'Picks the range with the highest market-implied probability (market consensus).' },
+] as const;
+
+const MODELS = [
+  { value: 'gaussian', label: 'Gaussian',        desc: 'Normal distribution centred on spot price. σ controls the spread.' },
+  { value: 'skewed',   label: 'Skewed Gaussian', desc: 'Gaussian shifted by Fear & Greed index — contrarian (fear → bullish, greed → bearish).' },
+  { value: 'uniform',  label: 'Uniform',         desc: 'Equal probability across all 500 bins. Useful as a baseline / stress-test.' },
 ] as const;
 
 function fmtExpiry(endTimeUtc: number): string {
   if (!endTimeUtc) return '—';
-  const nowMs = Date.now();
-  const endMs = endTimeUtc * 1000;
-  const diffMs = endMs - nowMs;
+  const diffMs = endTimeUtc * 1000 - Date.now();
   if (diffMs <= 0) return 'expired';
   const diffMins = Math.floor(diffMs / 60000);
   if (diffMins < 60) return `~${diffMins}m left`;
   const diffHours = Math.floor(diffMs / 3600000);
-  if (diffHours < 24) {
-    const t = new Date(endMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    return `~${diffHours}h · ends ${t}`;
-  }
+  if (diffHours < 24) return `~${diffHours}h · ends ${new Date(endTimeUtc * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
   const diffDays = Math.floor(diffMs / 86400000);
-  if (diffDays < 7) return `${diffDays}d · ${new Date(endMs).toLocaleDateString([], { month: 'short', day: 'numeric' })}`;
-  return new Date(endMs).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' });
+  if (diffDays < 7) return `${diffDays}d · ${new Date(endTimeUtc * 1000).toLocaleDateString([], { month: 'short', day: 'numeric' })}`;
+  return new Date(endTimeUtc * 1000).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
 function Tooltip({ text }: { text: string }) {
   return (
-    <span className="ml-1 cursor-help text-[#444] hover:text-[#666] text-[11px]" title={text}>
-      ⓘ
-    </span>
+    <span className="ml-1 cursor-help text-[#444] hover:text-[#666] text-[11px]" title={text}>ⓘ</span>
   );
 }
+
+type Mode = 'strategy' | 'kelly';
 
 export default function ConfigCard({ running, onStart, onStop, onError, onClearError }: Props) {
   const [token, setToken] = useState('');
@@ -54,17 +55,26 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
   const [marketHint, setMarketHint] = useState('');
   const [marketHintColor, setMarketHintColor] = useState('text-[#666666]');
   const [loadingMarkets, setLoadingMarkets] = useState(false);
+
+  const [mode, setMode] = useState<Mode>('strategy');
+
   const [strategy, setStrategy] = useState('bestodds');
   const [contracts, setContracts] = useState(1);
+  const [noDuplicates, setNoDuplicates] = useState(true);
+  const [selectedOptionId, setSelectedOptionId] = useState(0);
+
+  const [model, setModel] = useState('gaussian');
+  const [sigmaPct, setSigmaPct] = useState(5);
+  const [kellyFraction, setKellyFraction] = useState(0.25);
+
   const [pollSec, setPollSec] = useState(60);
   const [maxTrades, setMaxTrades] = useState(5);
   const [dryRun, setDryRun] = useState(true);
   const [minExpiryMins, setMinExpiryMins] = useState(10);
   const [maxWalletPct, setMaxWalletPct] = useState(10);
-  const [noDuplicates, setNoDuplicates] = useState(true);
+
   const [outcomes, setOutcomes] = useState<Outcome[]>([]);
   const [loadingOutcomes, setLoadingOutcomes] = useState(false);
-  const [selectedOptionId, setSelectedOptionId] = useState(0); // 0 = use strategy
   const [quickContracts, setQuickContracts] = useState(1);
   const [quickDryRun, setQuickDryRun] = useState(false);
   const [quickBusy, setQuickBusy] = useState(false);
@@ -99,7 +109,7 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
       setSelectedMarket(String(top[0].topic_id));
       const hourly = ms.filter(m => m.end_time_utc && (m.end_time_utc - Date.now() / 1000) < 86400).length;
       const extra = ms.length > 40 ? ` (showing 40 of ${ms.length})` : '';
-      setMarketHint(`${ms.length} active markets${extra} — soonest first. ${hourly > 0 ? `${hourly} expire within 24h (pick those).` : ''}`);
+      setMarketHint(`${ms.length} active markets${extra} — soonest first. ${hourly > 0 ? `${hourly} expire within 24h.` : ''}`);
       setMarketHintColor('text-[#00c48c]');
     } catch (e: unknown) {
       setMarketHint('Failed: ' + (e instanceof Error ? e.message : e));
@@ -119,18 +129,36 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
       try { await postToken(token); } catch { }
     }
     try {
-      await startBot({
-        topic_id: topicID,
-        contracts,
-        strategy,
-        poll_sec: pollSec,
-        max_trades: maxTrades,
-        dry_run: dryRun,
-        min_expiry_mins: minExpiryMins,
-        max_wallet_pct: maxWalletPct,
-        no_duplicates: noDuplicates,
-        forced_option_id: selectedOptionId,
-      });
+      if (mode === 'kelly') {
+        await startBot({
+          topic_id: topicID,
+          contracts: 1,
+          strategy: '',
+          poll_sec: pollSec,
+          max_trades: maxTrades,
+          dry_run: dryRun,
+          min_expiry_mins: minExpiryMins,
+          max_wallet_pct: maxWalletPct,
+          no_duplicates: false,
+          forced_option_id: 0,
+          model,
+          sigma_pct: sigmaPct,
+          kelly_fraction: kellyFraction,
+        });
+      } else {
+        await startBot({
+          topic_id: topicID,
+          contracts,
+          strategy,
+          poll_sec: pollSec,
+          max_trades: maxTrades,
+          dry_run: dryRun,
+          min_expiry_mins: minExpiryMins,
+          max_wallet_pct: maxWalletPct,
+          no_duplicates: noDuplicates,
+          forced_option_id: selectedOptionId,
+        });
+      }
       onClearError();
       onStart();
     } catch (e: unknown) {
@@ -139,12 +167,8 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
   };
 
   const handleStop = async () => {
-    try {
-      await stopBot();
-      onStop();
-    } catch (e: unknown) {
-      onError(e instanceof Error ? e.message : 'Failed to stop');
-    }
+    try { await stopBot(); onStop(); }
+    catch (e: unknown) { onError(e instanceof Error ? e.message : 'Failed to stop'); }
   };
 
   const handleLoadOutcomes = async () => {
@@ -155,8 +179,7 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
     setSelectedOptionId(0);
     setQuickResult(null);
     try {
-      const data = await fetchQuotes(topicID);
-      setOutcomes(data);
+      setOutcomes(await fetchQuotes(topicID));
     } catch (e: unknown) {
       onError('Failed to load ranges: ' + (e instanceof Error ? e.message : e));
     } finally {
@@ -171,8 +194,7 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
     setQuickBusy(true);
     setQuickResult(null);
     try {
-      const res = await quickTrade({ topic_id: topicID, option_id: selectedOptionId, contracts: quickContracts, dry_run: quickDryRun });
-      setQuickResult(res);
+      setQuickResult(await quickTrade({ topic_id: topicID, option_id: selectedOptionId, contracts: quickContracts, dry_run: quickDryRun }));
     } catch (e: unknown) {
       setQuickResult({ error: e instanceof Error ? e.message : 'Trade failed', option_id: 0, range: '', contracts: 0, cost_millisats: 0, commission_millisats: 0, yes_price_millisats: 0, dry_run: false });
     } finally {
@@ -180,7 +202,15 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
     }
   };
 
+  const kellyFractionLabel = () => {
+    const pct = Math.round(kellyFraction * 100);
+    if (kellyFraction <= 0.25) return `${pct}%-Kelly — conservative (Benter: ≤ ¼ for new models)`;
+    if (kellyFraction >= 0.75) return `${pct}%-Kelly — ⚠ high; overestimated edge causes capital shrinkage`;
+    return `${pct}%-Kelly`;
+  };
+
   const selectedStratDesc = STRATEGIES.find(s => s.value === strategy)?.desc ?? '';
+  const selectedModelDesc = MODELS.find(m => m.value === model)?.desc ?? '';
 
   return (
     <div className="card p-5">
@@ -211,14 +241,11 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
             {markets.length === 0 ? (
               <option value="">— paste token then click Load —</option>
             ) : (
-              markets.map((m) => {
-                const expiry = fmtExpiry(m.end_time_utc);
-                return (
-                  <option key={m.topic_id} value={m.topic_id}>
-                    #{m.topic_id} — {m.title} ({expiry})
-                  </option>
-                );
-              })
+              markets.map((m) => (
+                <option key={m.topic_id} value={m.topic_id}>
+                  #{m.topic_id} — {m.title} ({fmtExpiry(m.end_time_utc)})
+                </option>
+              ))
             )}
           </select>
           <button
@@ -229,129 +256,158 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
             {loadingMarkets ? 'Loading…' : 'Load ↻'}
           </button>
         </div>
-        {marketHint && (
-          <p className={`text-[11px] mt-1 ${marketHintColor}`}>{marketHint}</p>
-        )}
+        {marketHint && <p className={`text-[11px] mt-1 ${marketHintColor}`}>{marketHint}</p>}
       </div>
 
-      {/* Strategy */}
-      <div className="mb-1">
-        <label className="field-label">Strategy</label>
-        <select
-          value={strategy}
-          onChange={(e) => setStrategy(e.target.value)}
-          className="field-input cursor-pointer"
-        >
-          {STRATEGIES.map(s => (
-            <option key={s.value} value={s.value}>{s.label}</option>
-          ))}
-        </select>
-        {selectedStratDesc && (
-          <p className="text-[11px] text-[#555] mt-1 leading-relaxed">{selectedStratDesc}</p>
-        )}
-      </div>
-
-      <div className="my-4 border-t border-[#1a1a1a]" />
-
-      {/* Contracts */}
+      { }
       <div className="mb-3.5">
-        <label className="field-label">Contracts per trade</label>
-        <div className="flex items-center gap-2.5">
-          <input
-            type="range" min={1} max={10} value={contracts}
-            onChange={(e) => setContracts(Number(e.target.value))}
-            className="flex-1 accent-[#f7931a]"
-          />
-          <span className="font-mono text-[13px] text-[#f7931a] min-w-[28px] text-right">{contracts}</span>
+        <label className="field-label">Trading Mode</label>
+        <div className="flex rounded overflow-hidden border border-[#222222]">
+          <button
+            onClick={() => setMode('strategy')}
+            className={`flex-1 py-2 text-[12px] font-semibold transition-colors cursor-pointer ${
+              mode === 'strategy' ? 'bg-[#f7931a] text-black' : 'bg-[#0a0a0a] text-[#666] hover:text-[#e0e0e0]'
+            }`}
+          >
+            Strategy
+          </button>
+          <button
+            onClick={() => setMode('kelly')}
+            className={`flex-1 py-2 text-[12px] font-semibold transition-colors cursor-pointer ${
+              mode === 'kelly' ? 'bg-[#00c48c] text-black' : 'bg-[#0a0a0a] text-[#666] hover:text-[#e0e0e0]'
+            }`}
+          >
+            Kelly (QLS-LMSR)
+          </button>
         </div>
       </div>
 
-      {/* Poll interval */}
+      { }
+      {mode === 'strategy' && (
+        <>
+          <div className="mb-1">
+            <label className="field-label">Strategy</label>
+            <select value={strategy} onChange={(e) => setStrategy(e.target.value)} className="field-input cursor-pointer">
+              {STRATEGIES.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+            </select>
+            {selectedStratDesc && <p className="text-[11px] text-[#555] mt-1 leading-relaxed">{selectedStratDesc}</p>}
+          </div>
+
+          <div className="my-4 border-t border-[#1a1a1a]" />
+
+          <div className="mb-3.5">
+            <label className="field-label">Contracts per trade</label>
+            <div className="flex items-center gap-2.5">
+              <input type="range" min={1} max={10} value={contracts} onChange={(e) => setContracts(Number(e.target.value))} className="flex-1 accent-[#f7931a]" />
+              <span className="font-mono text-[13px] text-[#f7931a] min-w-[28px] text-right">{contracts}</span>
+            </div>
+          </div>
+        </>
+      )}
+
+      { }
+      {mode === 'kelly' && (
+        <>
+          <div className="mb-3.5">
+            <label className="field-label">
+              Forecast Model
+              <Tooltip text="The probability model that generates π*ᵢ — the distribution over 500 BTC price bins. Kelly trades bins where model prob > market-implied prob." />
+            </label>
+            <select value={model} onChange={(e) => setModel(e.target.value)} className="field-input cursor-pointer" style={{ borderColor: '#00c48c33' }}>
+              {MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+            </select>
+            {selectedModelDesc && <p className="text-[11px] text-[#00c48c]/60 mt-1 leading-relaxed">{selectedModelDesc}</p>}
+          </div>
+
+          {(model === 'gaussian' || model === 'skewed') && (
+            <div className="mb-3.5">
+              <label className="field-label">
+                σ — standard deviation (% of spot)
+                <Tooltip text="Width of the Gaussian forecast. 5% at $80k = ±$4000. Wider σ = more bins marked as uncertain = fewer trades." />
+              </label>
+              <div className="flex items-center gap-2.5">
+                <input type="range" min={1} max={20} step={0.5} value={sigmaPct} onChange={(e) => setSigmaPct(Number(e.target.value))} className="flex-1 accent-[#00c48c]" />
+                <span className="font-mono text-[13px] text-[#00c48c] min-w-[36px] text-right">{sigmaPct}%</span>
+              </div>
+            </div>
+          )}
+
+          <div className="mb-1">
+            <label className="field-label">
+              Kelly fraction c
+              <Tooltip text="Fraction of the Kelly-optimal bet to execute. Benter (1994) warns: if edge is overestimated by 2×, full Kelly shrinks your capital. ¼-Kelly is the safe default." />
+            </label>
+            <div className="flex items-center gap-2.5">
+              <input type="range" min={0.05} max={1} step={0.05} value={kellyFraction} onChange={(e) => setKellyFraction(Number(e.target.value))} className="flex-1 accent-[#00c48c]" />
+              <span className="font-mono text-[13px] text-[#00c48c] min-w-[36px] text-right">{kellyFraction.toFixed(2)}</span>
+            </div>
+            <p className={`text-[11px] mt-1 leading-relaxed ${kellyFraction >= 0.75 ? 'text-[#ff4d4d]' : 'text-[#555]'}`}>
+              {kellyFractionLabel()}
+            </p>
+          </div>
+
+          <div className="my-4 border-t border-[#1a1a1a]" />
+        </>
+      )}
+
+      { }
       <div className="mb-3.5">
         <label className="field-label">Poll interval (seconds)</label>
         <div className="flex items-center gap-2.5">
-          <input
-            type="range" min={10} max={300} step={5} value={pollSec}
-            onChange={(e) => setPollSec(Number(e.target.value))}
-            className="flex-1 accent-[#f7931a]"
-          />
+          <input type="range" min={10} max={300} step={5} value={pollSec} onChange={(e) => setPollSec(Number(e.target.value))} className="flex-1 accent-[#f7931a]" />
           <span className="font-mono text-[13px] text-[#f7931a] min-w-[28px] text-right">{pollSec}s</span>
         </div>
       </div>
 
-      {/* Max trades */}
       <div className="mb-3.5">
         <label className="field-label">Max trades this session</label>
-        <input
-          type="number" value={maxTrades}
-          onChange={(e) => setMaxTrades(Number(e.target.value))}
-          min={1} max={100}
-          className="field-input"
-        />
+        <input type="number" value={maxTrades} onChange={(e) => setMaxTrades(Number(e.target.value))} min={1} max={100} className="field-input" />
       </div>
 
       <div className="my-4 border-t border-[#1a1a1a]" />
       <p className="section-title mb-3">Risk Controls</p>
 
-      {/* Min expiry guard */}
       <div className="mb-3.5">
         <label className="field-label">
           Min time before expiry (minutes)
           <Tooltip text="Skip trading if the market expires within this many minutes. Near expiry, price swings are unpredictable." />
         </label>
         <div className="flex items-center gap-2.5">
-          <input
-            type="range" min={0} max={60} step={5} value={minExpiryMins}
-            onChange={(e) => setMinExpiryMins(Number(e.target.value))}
-            className="flex-1 accent-[#f7931a]"
-          />
+          <input type="range" min={0} max={60} step={5} value={minExpiryMins} onChange={(e) => setMinExpiryMins(Number(e.target.value))} className="flex-1 accent-[#f7931a]" />
           <span className="font-mono text-[13px] text-[#f7931a] min-w-[28px] text-right">
             {minExpiryMins === 0 ? 'off' : `${minExpiryMins}m`}
           </span>
         </div>
       </div>
 
-      {/* Max wallet pct */}
       <div className="mb-3.5">
         <label className="field-label">
           Max wallet % per trade
-          <Tooltip text="Cap each trade cost as a percentage of your current wallet balance. Set to 0 to disable." />
+          <Tooltip text="In Kelly mode: budget passed to the optimizer = this % of wallet. In strategy mode: cap per single trade." />
         </label>
         <div className="flex items-center gap-2.5">
-          <input
-            type="range" min={0} max={50} step={1} value={maxWalletPct}
-            onChange={(e) => setMaxWalletPct(Number(e.target.value))}
-            className="flex-1 accent-[#f7931a]"
-          />
+          <input type="range" min={0} max={50} step={1} value={maxWalletPct} onChange={(e) => setMaxWalletPct(Number(e.target.value))} className="flex-1 accent-[#f7931a]" />
           <span className="font-mono text-[13px] text-[#f7931a] min-w-[28px] text-right">
             {maxWalletPct === 0 ? 'off' : `${maxWalletPct}%`}
           </span>
         </div>
       </div>
 
-      {/* No duplicates */}
-      <div className="mb-3.5">
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox" checked={noDuplicates}
-            onChange={(e) => setNoDuplicates(e.target.checked)}
-            className="w-4 h-4 accent-[#f7931a] cursor-pointer"
-          />
-          <span className="text-[13px]">
-            No duplicates
-            <Tooltip text="Don't trade the same option range twice per session. Prevents buying the same position repeatedly when BTC isn't moving." />
-          </span>
-        </label>
-      </div>
+      {mode === 'strategy' && (
+        <div className="mb-3.5">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={noDuplicates} onChange={(e) => setNoDuplicates(e.target.checked)} className="w-4 h-4 accent-[#f7931a] cursor-pointer" />
+            <span className="text-[13px]">
+              No duplicates
+              <Tooltip text="Don't trade the same option range twice per session." />
+            </span>
+          </label>
+        </div>
+      )}
 
-      {/* Dry run */}
       <div className="mb-3.5">
         <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox" checked={dryRun}
-            onChange={(e) => setDryRun(e.target.checked)}
-            className="w-4 h-4 accent-[#f7931a] cursor-pointer"
-          />
+          <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} className="w-4 h-4 accent-[#f7931a] cursor-pointer" />
           <span className="text-[13px]">Dry run (log only, no real trades)</span>
         </label>
       </div>
@@ -361,7 +417,9 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
         <button
           onClick={handleStart}
           disabled={running}
-          className="flex-1 py-2.5 px-4 rounded bg-[#f7931a] text-black text-[13px] font-semibold cursor-pointer hover:opacity-85 disabled:opacity-35 disabled:cursor-not-allowed transition-opacity"
+          className={`flex-1 py-2.5 px-4 rounded text-[13px] font-semibold cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed transition-opacity hover:opacity-85 ${
+            mode === 'kelly' ? 'bg-[#00c48c] text-black' : 'bg-[#f7931a] text-black'
+          }`}
         >
           Start
         </button>
@@ -374,100 +432,89 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
         </button>
       </div>
 
-      {/* Range Picker + Quick Trade */}
-      <div className="mt-5 pt-4 border-t border-[#1a1a1a]">
-        <div className="flex items-center justify-between mb-3">
-          <p className="section-title">
-            Pick Range to Trade
-            <Tooltip text="Load the live quotes for the selected market, pick a specific range, then either let the bot always trade it or place a one-off trade immediately." />
-          </p>
-          <button
-            onClick={handleLoadOutcomes}
-            disabled={loadingOutcomes || !selectedMarket}
-            className="px-3 py-1 bg-[#1a1a1a] border border-[#222222] rounded text-[#f7931a] text-[11px] font-semibold whitespace-nowrap hover:opacity-80 disabled:opacity-40 disabled:cursor-not-allowed transition-opacity cursor-pointer"
-          >
-            {loadingOutcomes ? 'Loading…' : 'Load Ranges ↻'}
-          </button>
-        </div>
-
-        {outcomes.length > 0 && (
-          <>
-            <div className="mb-3 max-h-40 overflow-y-auto rounded border border-[#222222] bg-[#0a0a0a]">
-              { }
-              <div
-                onClick={() => { setSelectedOptionId(0); setQuickResult(null); }}
-                className={`px-3 py-2 text-[12px] font-mono cursor-pointer border-b border-[#1a1a1a] transition-colors ${selectedOptionId === 0 ? 'bg-[#f7931a]/10 text-[#f7931a]' : 'text-[#666666] hover:bg-[#1a1a1a]'}`}
-              >
-                — use strategy (auto) —
-              </div>
-              {outcomes.map((o) => (
-                <div
-                  key={o.option_id}
-                  onClick={() => { setSelectedOptionId(o.option_id); setQuickResult(null); }}
-                  className={`px-3 py-2 text-[12px] font-mono cursor-pointer border-b border-[#1a1a1a] last:border-0 transition-colors ${selectedOptionId === o.option_id ? 'bg-[#00c48c]/10 text-[#00c48c]' : 'text-[#e0e0e0] hover:bg-[#1a1a1a]'}`}
-                >
-                  <span className="font-semibold">{o.name}</span>
-                  <span className="ml-2 text-[#666666]">yes: {o.yes_price_millisats}ms · #{o.option_id}</span>
-                </div>
-              ))}
-            </div>
-
-            {selectedOptionId > 0 && (
-              <p className="text-[11px] text-[#f7931a] mb-3">
-                Bot will always trade this range. Turn off No Duplicates to repeat each tick.
-              </p>
-            )}
-
-            <div className="mb-3">
-              <label className="field-label">Contracts (for one-off trade)</label>
-              <input
-                type="number"
-                value={quickContracts}
-                onChange={(e) => setQuickContracts(Math.max(1, parseInt(e.target.value) || 1))}
-                min={1} max={100}
-                className="field-input"
-              />
-            </div>
-
-            <div className="mb-3">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox" checked={quickDryRun}
-                  onChange={(e) => setQuickDryRun(e.target.checked)}
-                  className="w-4 h-4 accent-[#f7931a] cursor-pointer"
-                />
-                <span className="text-[13px]">Dry run (one-off trade only)</span>
-              </label>
-            </div>
-
+      { }
+      {mode === 'strategy' && (
+        <div className="mt-5 pt-4 border-t border-[#1a1a1a]">
+          <div className="flex items-center justify-between mb-3">
+            <p className="section-title">
+              Pick Range to Trade
+              <Tooltip text="Load live quotes, pick a specific range, then let the bot always trade it or place a one-off trade." />
+            </p>
             <button
-              onClick={handleQuickTrade}
-              disabled={quickBusy || !selectedOptionId}
-              className="w-full py-2.5 px-4 rounded border border-[#00c48c] text-[#00c48c] bg-[#00c48c]/5 text-[13px] font-semibold cursor-pointer hover:bg-[#00c48c]/10 disabled:opacity-35 disabled:cursor-not-allowed transition-colors"
+              onClick={handleLoadOutcomes}
+              disabled={loadingOutcomes || !selectedMarket}
+              className="px-3 py-1 bg-[#1a1a1a] border border-[#222222] rounded text-[#f7931a] text-[11px] font-semibold whitespace-nowrap hover:opacity-80 disabled:opacity-40 disabled:cursor-not-allowed transition-opacity cursor-pointer"
             >
-              {quickBusy ? 'Placing…' : 'Trade Now (one-off)'}
+              {loadingOutcomes ? 'Loading…' : 'Load Ranges ↻'}
             </button>
+          </div>
 
-            {quickResult && (
-              <div className={`mt-3 p-3 rounded text-[12px] font-mono leading-relaxed ${quickResult.error ? 'bg-[#ff4d4d]/10 border border-[#ff4d4d] text-[#ff4d4d]' : 'bg-[#00c48c]/10 border border-[#00c48c] text-[#00c48c]'}`}>
-                {quickResult.error ? `⚠ ${quickResult.error}` : (
-                  <>
-                    <div>{quickResult.dry_run ? '[DRY] ' : '✓ Trade placed'}</div>
-                    <div>Range: {quickResult.range} · #{quickResult.option_id}</div>
-                    {!quickResult.dry_run && (
-                      <>
-                        <div>Cost: {quickResult.cost_millisats < 1000 ? '< 1' : Math.floor(quickResult.cost_millisats / 1000)} sat · Comm: {quickResult.commission_millisats < 1000 ? '< 1' : Math.floor(quickResult.commission_millisats / 1000)} sat</div>
-                        {quickResult.trade_id && <div className="text-[11px] opacity-70 mt-1">ID: {quickResult.trade_id}</div>}
-                      </>
-                    )}
-                    {quickResult.dry_run && <div>Yes price: {quickResult.yes_price_millisats} ms/contract</div>}
-                  </>
-                )}
+          {outcomes.length > 0 && (
+            <>
+              <div className="mb-3 max-h-40 overflow-y-auto rounded border border-[#222222] bg-[#0a0a0a]">
+                <div
+                  onClick={() => { setSelectedOptionId(0); setQuickResult(null); }}
+                  className={`px-3 py-2 text-[12px] font-mono cursor-pointer border-b border-[#1a1a1a] transition-colors ${selectedOptionId === 0 ? 'bg-[#f7931a]/10 text-[#f7931a]' : 'text-[#666666] hover:bg-[#1a1a1a]'}`}
+                >
+                  — use strategy (auto) —
+                </div>
+                {outcomes.map((o) => (
+                  <div
+                    key={o.option_id}
+                    onClick={() => { setSelectedOptionId(o.option_id); setQuickResult(null); }}
+                    className={`px-3 py-2 text-[12px] font-mono cursor-pointer border-b border-[#1a1a1a] last:border-0 transition-colors ${selectedOptionId === o.option_id ? 'bg-[#00c48c]/10 text-[#00c48c]' : 'text-[#e0e0e0] hover:bg-[#1a1a1a]'}`}
+                  >
+                    <span className="font-semibold">{o.name}</span>
+                    <span className="ml-2 text-[#666666]">yes: {o.yes_price_millisats}ms · #{o.option_id}</span>
+                  </div>
+                ))}
               </div>
-            )}
-          </>
-        )}
-      </div>
+
+              {selectedOptionId > 0 && (
+                <p className="text-[11px] text-[#f7931a] mb-3">Bot will always trade this range. Turn off No Duplicates to repeat each tick.</p>
+              )}
+
+              <div className="mb-3">
+                <label className="field-label">Contracts (for one-off trade)</label>
+                <input type="number" value={quickContracts} onChange={(e) => setQuickContracts(Math.max(1, parseInt(e.target.value) || 1))} min={1} max={100} className="field-input" />
+              </div>
+
+              <div className="mb-3">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={quickDryRun} onChange={(e) => setQuickDryRun(e.target.checked)} className="w-4 h-4 accent-[#f7931a] cursor-pointer" />
+                  <span className="text-[13px]">Dry run (one-off trade only)</span>
+                </label>
+              </div>
+
+              <button
+                onClick={handleQuickTrade}
+                disabled={quickBusy || !selectedOptionId}
+                className="w-full py-2.5 px-4 rounded border border-[#00c48c] text-[#00c48c] bg-[#00c48c]/5 text-[13px] font-semibold cursor-pointer hover:bg-[#00c48c]/10 disabled:opacity-35 disabled:cursor-not-allowed transition-colors"
+              >
+                {quickBusy ? 'Placing…' : 'Trade Now (one-off)'}
+              </button>
+
+              {quickResult && (
+                <div className={`mt-3 p-3 rounded text-[12px] font-mono leading-relaxed ${quickResult.error ? 'bg-[#ff4d4d]/10 border border-[#ff4d4d] text-[#ff4d4d]' : 'bg-[#00c48c]/10 border border-[#00c48c] text-[#00c48c]'}`}>
+                  {quickResult.error ? `⚠ ${quickResult.error}` : (
+                    <>
+                      <div>{quickResult.dry_run ? '[DRY] ' : '✓ Trade placed'}</div>
+                      <div>Range: {quickResult.range} · #{quickResult.option_id}</div>
+                      {!quickResult.dry_run && (
+                        <>
+                          <div>Cost: {quickResult.cost_millisats < 1000 ? '< 1' : Math.floor(quickResult.cost_millisats / 1000)} sat · Comm: {quickResult.commission_millisats < 1000 ? '< 1' : Math.floor(quickResult.commission_millisats / 1000)} sat</div>
+                          {quickResult.trade_id && <div className="text-[11px] opacity-70 mt-1">ID: {quickResult.trade_id}</div>}
+                        </>
+                      )}
+                      {quickResult.dry_run && <div>Yes price: {quickResult.yes_price_millisats} ms/contract</div>}
+                    </>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
