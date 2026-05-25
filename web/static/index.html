@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Glimpse Kelly Bot</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 20px; }
+    h1 { color: #58a6ff; }
+    .tip { color: #8b949e; margin-top: 20px; }
+    code { background: #161b22; padding: 2px 6px; border-radius: 4px; color: #79c0ff; }
+  </style>
+</head>
+<body>
+  <h1>Glimpse Kelly Bot</h1>
+  <p>API endpoints are live. Use the REST API or launch the TUI mode:</p>
+  <pre>./glimpse-bot --tui --model gaussian --sigma 5 --kelly 0.25</pre>
+  <p class="tip">Available endpoints: <code>/api/status</code> <code>/api/markets</code>
+    <code>/api/quotes?topic_id=N</code> <code>/api/wallet</code>
+    <code>/api/start</code> <code>/api/stop</code> <code>/api/spot</code>
+    <code>/api/quicktrade</code></p>
+</body>
+</html>

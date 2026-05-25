@@ -8,51 +8,79 @@ import (
 	"time"
 
 	"github.com/ritankarsaha/glimpse-bot/api"
+	"github.com/ritankarsaha/glimpse-bot/kelly"
+	"github.com/ritankarsaha/glimpse-bot/model"
 	"github.com/ritankarsaha/glimpse-bot/strategy"
 )
 
 type BotConfig struct {
 	TopicID        int
-	Contracts      int
+	Contracts      int     
 	PollSec        int
 	MaxTrades      int
 	DryRun         bool
-	MinExpiryMins  int  
-	MaxWalletPct   int  
-	NoDuplicates   bool 
-	ForcedOptionID int  
+	MinExpiryMins  int
+	MaxWalletPct   int
+	NoDuplicates   bool
+	ForcedOptionID int 
+
+	// Kelly mode (activated when KellyFraction > 0)
+	ModelName     string 
+	SigmaPct      float64 
+	KellyFraction float64 
+}
+
+type KellyTradeSummary struct {
+	BinIndex  int     `json:"bin_index"`
+	Range     string  `json:"range"`
+	MarketPct float64 `json:"market_pct"`
+	ModelPct  float64 `json:"model_pct"`
+	EdgePct   float64 `json:"edge_pct"`
+	Contracts int     `json:"contracts"`
+}
+
+type KellyLeg struct {
+	BinIndex  int     `json:"bin_index"`
+	Range     string  `json:"range"`
+	Contracts int     `json:"contracts"`
+	EdgePct   float64 `json:"edge_pct"`
 }
 
 type BotState struct {
-	Running            bool      `json:"running"`
-	Paused             bool      `json:"paused"`
-	SessionTrades      int       `json:"session_trades"`
-	TotalCostMillisats int64     `json:"total_cost_millisats"`
-	LastSpot           float64   `json:"last_spot"`
-	LastFng            int       `json:"last_fng"`
-	LastFngLabel       string    `json:"last_fng_label"`
-	WalletBalance      int64     `json:"wallet_balance"`
-	LastError          string    `json:"last_error"`
-	LastTradeTime      time.Time `json:"last_trade_time"`
-	RecentLogs         []string  `json:"recent_logs"`
-	DryRun             bool      `json:"dry_run"`
+	Running            bool                `json:"running"`
+	Paused             bool                `json:"paused"`
+	SessionTrades      int                 `json:"session_trades"`
+	TotalCostMillisats int64               `json:"total_cost_millisats"`
+	LastSpot           float64             `json:"last_spot"`
+	LastFng            int                 `json:"last_fng"`
+	LastFngLabel       string              `json:"last_fng_label"`
+	WalletBalance      int64               `json:"wallet_balance"`
+	LastError          string              `json:"last_error"`
+	LastTradeTime      time.Time           `json:"last_trade_time"`
+	RecentLogs         []string            `json:"recent_logs"`
+	DryRun             bool                `json:"dry_run"`
+	ModelName     string              `json:"model_name,omitempty"`
+	KellyFraction float64             `json:"kelly_fraction,omitempty"`
+	MispriceCount int                 `json:"misprice_count"`
+	KellyTrades   []KellyTradeSummary `json:"kelly_trades,omitempty"`
 }
 
 type TradeRecord struct {
-	TradeID             string    `json:"trade_id"`
-	TopicID             int       `json:"topic_id"`
-	OptionID            int       `json:"option_id"`
-	Range               string    `json:"range"`
-	Contracts           int       `json:"contracts"`
-	CostMillisats       int64     `json:"cost_millisats"`
-	CommissionMillisats int64     `json:"commission_millisats"`
-	Timestamp           time.Time `json:"timestamp"`
-	DryRun              bool      `json:"dry_run"`
+	TradeID             string     `json:"trade_id"`
+	TopicID             int        `json:"topic_id"`
+	OptionID            int        `json:"option_id"`
+	Range               string     `json:"range"`
+	Contracts           int        `json:"contracts"`
+	CostMillisats       int64      `json:"cost_millisats"`
+	CommissionMillisats int64      `json:"commission_millisats"`
+	Timestamp           time.Time  `json:"timestamp"`
+	DryRun              bool       `json:"dry_run"`
+	KellyLegs           []KellyLeg `json:"kelly_legs,omitempty"`
 }
 
 type Bot struct {
 	client        *api.GlimpseClient
-	strat         strategy.Strategy
+	strat         strategy.Strategy 
 	cfg           BotConfig
 	mu            sync.RWMutex
 	state         BotState
@@ -61,6 +89,9 @@ type Bot struct {
 	tradelog      []TradeRecord
 	tradedOptions map[int]bool
 	cancel        context.CancelFunc
+
+	forecaster model.Forecaster
+	kellyCfg   kelly.Config
 }
 
 func NewBot(client *api.GlimpseClient, strat strategy.Strategy, cfg BotConfig) *Bot {
@@ -82,14 +113,36 @@ func (b *Bot) Start() error {
 		return fmt.Errorf("no JWT token configured — paste one via the UI first")
 	}
 
-	b.state = BotState{Running: true, DryRun: b.cfg.DryRun}
+	if b.cfg.KellyFraction > 0 {
+		name := b.cfg.ModelName
+		if name == "" {
+			name = "gaussian"
+		}
+		sigma := b.cfg.SigmaPct
+		if sigma <= 0 {
+			sigma = 5.0
+		}
+		f, err := model.FromName(name, sigma)
+		if err != nil {
+			return fmt.Errorf("forecast model: %w", err)
+		}
+		b.forecaster = f
+		b.kellyCfg = kelly.DefaultConfig()
+		b.kellyCfg.KellyFraction = b.cfg.KellyFraction
+	}
+
+	b.state = BotState{
+		Running:       true,
+		DryRun:        b.cfg.DryRun,
+		ModelName:     b.cfg.ModelName,
+		KellyFraction: b.cfg.KellyFraction,
+	}
 	b.tradelog = nil
 	b.logs = nil
 	b.tradedOptions = make(map[int]bool)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	b.cancel = cancel
-
 	go b.run(ctx)
 	return nil
 }
@@ -145,6 +198,7 @@ func (b *Bot) GetTradelog() []TradeRecord {
 	return out
 }
 
+
 func (b *Bot) run(ctx context.Context) {
 	defer func() {
 		b.mu.Lock()
@@ -153,10 +207,15 @@ func (b *Bot) run(ctx context.Context) {
 		b.appendLog("Bot stopped")
 	}()
 
+	modeName := "strategy"
+	if b.cfg.KellyFraction > 0 {
+		modeName = fmt.Sprintf("kelly(model=%s c=%.2f)", b.cfg.ModelName, b.cfg.KellyFraction)
+	} else if b.strat != nil {
+		modeName = "strategy=" + b.strat.Name()
+	}
 	b.appendLog(fmt.Sprintf(
-		"Bot started — strategy=%s topicID=%d contracts=%d dryRun=%v minExpiry=%dm maxWalletPct=%d%% noDuplicates=%v",
-		b.strat.Name(), b.cfg.TopicID, b.cfg.Contracts, b.cfg.DryRun,
-		b.cfg.MinExpiryMins, b.cfg.MaxWalletPct, b.cfg.NoDuplicates,
+		"Bot started — %s topicID=%d dryRun=%v minExpiry=%dm maxWalletPct=%d%%",
+		modeName, b.cfg.TopicID, b.cfg.DryRun, b.cfg.MinExpiryMins, b.cfg.MaxWalletPct,
 	))
 
 	b.tick(ctx)
@@ -182,27 +241,24 @@ func (b *Bot) run(ctx context.Context) {
 	}
 }
 
-func (b *Bot) tick(ctx context.Context) {
+func (b *Bot) tick(_ context.Context) {
 	if b.IsPaused() {
 		b.appendLog("Paused — waiting for fresh JWT token")
 		return
 	}
 
-	// Fetch spot price
 	spot, err := b.client.GetBTCSpot()
 	if err != nil {
 		b.setError(fmt.Sprintf("fetching BTC spot: %v", err))
 		return
 	}
 
-	// Fear & Greed index
 	fng, fngLabel, err := b.client.GetFearAndGreed()
 	if err != nil {
 		fng, fngLabel = 50, "Neutral (F&G unavailable)"
 		b.appendLog(fmt.Sprintf("F&G unavailable (%v) — using neutral=50", err))
 	}
 
-	// Wallet balance
 	wallet, err := b.client.GetWalletBalance()
 	if err != nil {
 		if api.IsUnauthorized(err) {
@@ -220,7 +276,6 @@ func (b *Bot) tick(ctx context.Context) {
 		return
 	}
 
-	// Market quotes
 	market, err := b.client.GetQuotes(b.cfg.TopicID)
 	if err != nil {
 		if api.IsUnauthorized(err) {
@@ -231,30 +286,178 @@ func (b *Bot) tick(ctx context.Context) {
 		return
 	}
 
-	// Guard: already resolved
 	if market.IsResolved {
 		b.appendLog(fmt.Sprintf("Market %d already resolved, skipping", b.cfg.TopicID))
 		return
 	}
 
 	expiry := time.Unix(market.MarketEndTimeUTC, 0)
-
 	if time.Now().After(expiry.Add(5 * time.Minute)) {
 		b.appendLog(fmt.Sprintf("Market expired at %s, skipping", expiry.Format("15:04:05")))
 		return
 	}
-
-	// Guard: too close to expiry
 	if b.cfg.MinExpiryMins > 0 {
-		until := time.Until(expiry)
-		minDur := time.Duration(b.cfg.MinExpiryMins) * time.Minute
-		if until < minDur {
+		if until := time.Until(expiry); until < time.Duration(b.cfg.MinExpiryMins)*time.Minute {
 			b.appendLog(fmt.Sprintf("Market expires in %s (< %dm guard) — skipping tick",
 				until.Round(time.Second), b.cfg.MinExpiryMins))
 			return
 		}
 	}
 
+	b.mu.Lock()
+	b.state.LastSpot = spot
+	b.state.LastFng = fng
+	b.state.LastFngLabel = fngLabel
+	b.state.WalletBalance = wallet.Balance / 1000
+	b.state.LastError = ""
+	b.mu.Unlock()
+
+	if b.cfg.KellyFraction > 0 {
+		b.tickKelly(spot, fng, fngLabel, wallet, market, expiry)
+	} else {
+		b.tickStrategy(spot, fng, fngLabel, wallet, market, expiry)
+	}
+}
+
+func (b *Bot) tickKelly(spot float64, fng int, fngLabel string, wallet *api.WalletBalance, market *api.Market, expiry time.Time) {
+	b.appendLog(fmt.Sprintf("kelly tick: spot=$%.2f fng=%d(%s) expiry=%s",
+		spot, fng, fngLabel, time.Until(expiry).Round(time.Second)))
+
+	om := kelly.BuildOutcomeMap(market.Outcomes)
+
+	mdlProbs, err := b.forecaster.Forecast(spot, fng)
+	if err != nil {
+		b.setError(fmt.Sprintf("forecast: %v", err))
+		return
+	}
+
+	balSats := float64(wallet.Balance) / 1000.0
+	budgetSats := balSats * float64(b.cfg.MaxWalletPct) / 100.0
+
+	trades, err := kelly.Optimize(om, mdlProbs, budgetSats, b.kellyCfg)
+	if err != nil {
+		b.setError(fmt.Sprintf("kelly optimise: %v", err))
+		return
+	}
+	summaries := make([]KellyTradeSummary, 0, len(trades))
+	for _, t := range trades {
+		summaries = append(summaries, KellyTradeSummary{
+			BinIndex:  t.BinIndex,
+			Range:     t.Range,
+			MarketPct: t.MarketProb * 100,
+			ModelPct:  t.ModelProb * 100,
+			EdgePct:   t.Edge * 100,
+			Contracts: t.Contracts,
+		})
+	}
+	b.mu.Lock()
+	b.state.MispriceCount = len(trades)
+	b.state.KellyTrades = summaries
+	b.mu.Unlock()
+
+	if len(trades) == 0 {
+		b.appendLog("Kelly: no underpriced bins found — skipping")
+		return
+	}
+	b.appendLog(fmt.Sprintf("Kelly: %d underpriced bins, budget=%.0fsats", len(trades), budgetSats))
+
+	if b.cfg.DryRun {
+		b.executeKellyDryRun(trades)
+		return
+	}
+
+	legs := make([]api.Leg, 0, len(trades))
+	for _, t := range trades {
+		legs = append(legs, api.Leg{OptionID: t.OptionID, Contracts: t.Contracts})
+	}
+	resp, err := b.client.PlaceTrade(api.TradeRequest{
+		Topics: []api.TopicTrade{{TopicID: b.cfg.TopicID, Legs: legs}},
+	})
+	if err != nil {
+		if api.IsUnauthorized(err) {
+			b.setPaused("JWT expired — paste a fresh token in the UI")
+			return
+		}
+		b.setError(fmt.Sprintf("placing kelly trade: %v", err))
+		return
+	}
+	if resp.TopicsFailed > 0 {
+		b.setError(fmt.Sprintf("kelly trade rejected (topics_failed=%d)", resp.TopicsFailed))
+		log.Printf("[BOT] kelly trade rejected: %+v", resp)
+		return
+	}
+
+	var costMs, commMs int64
+	var tradeID string
+	for _, r := range resp.Results {
+		costMs += r.TotalCostMillisats
+		commMs += r.CommissionMillisats
+		tradeID = r.TradeID
+	}
+
+	kellyLegs := make([]KellyLeg, 0, len(trades))
+	for _, t := range trades {
+		kellyLegs = append(kellyLegs, KellyLeg{
+			BinIndex:  t.BinIndex,
+			Range:     t.Range,
+			Contracts: t.Contracts,
+			EdgePct:   t.Edge * 100,
+		})
+	}
+
+	record := TradeRecord{
+		TradeID:             tradeID,
+		TopicID:             b.cfg.TopicID,
+		Range:               fmt.Sprintf("KELLY(%d legs)", len(legs)),
+		CostMillisats:       costMs,
+		CommissionMillisats: commMs,
+		Timestamp:           time.Now(),
+		KellyLegs:           kellyLegs,
+	}
+	b.mu.Lock()
+	b.tradelog = append(b.tradelog, record)
+	b.state.SessionTrades++
+	b.state.TotalCostMillisats += costMs + commMs
+	b.state.LastTradeTime = record.Timestamp
+	b.mu.Unlock()
+
+	b.appendLog(fmt.Sprintf("Kelly trade placed: id=%s legs=%d cost=%dsats comm=%dsats",
+		tradeID, len(legs), costMs/1000, commMs/1000))
+}
+
+func (b *Bot) executeKellyDryRun(trades []kelly.Trade) {
+	var totalMs int64
+	kellyLegs := make([]KellyLeg, 0, len(trades))
+	for _, t := range trades {
+		ms := t.YesPriceMillisats * int64(t.Contracts)
+		totalMs += ms
+		kellyLegs = append(kellyLegs, KellyLeg{
+			BinIndex:  t.BinIndex,
+			Range:     t.Range,
+			Contracts: t.Contracts,
+			EdgePct:   t.Edge * 100,
+		})
+		b.appendLog(fmt.Sprintf("[DRY KELLY] range=%s contracts=%d edge=%.2f%% cost=%dsats",
+			t.Range, t.Contracts, t.Edge*100, ms/1000))
+	}
+	record := TradeRecord{
+		TradeID:       fmt.Sprintf("dry-kelly-%d", time.Now().UnixNano()),
+		TopicID:       b.cfg.TopicID,
+		Range:         fmt.Sprintf("KELLY(%d legs)", len(trades)),
+		CostMillisats: totalMs,
+		Timestamp:     time.Now(),
+		DryRun:        true,
+		KellyLegs:     kellyLegs,
+	}
+	b.mu.Lock()
+	b.tradelog = append(b.tradelog, record)
+	b.state.SessionTrades++
+	b.state.TotalCostMillisats += totalMs
+	b.state.LastTradeTime = record.Timestamp
+	b.mu.Unlock()
+}
+
+func (b *Bot) tickStrategy(spot float64, fng int, fngLabel string, wallet *api.WalletBalance, market *api.Market, expiry time.Time) {
 	var outcome *api.Outcome
 	if b.cfg.ForcedOptionID > 0 {
 		for i := range market.Outcomes {
@@ -282,8 +485,7 @@ func (b *Bot) tick(ctx context.Context) {
 		b.mu.RUnlock()
 		if alreadyTraded {
 			if b.cfg.ForcedOptionID > 0 {
-				b.appendLog(fmt.Sprintf("Option %d (range=%s) already traded this session — skipping (NoDuplicates, forced)",
-					outcome.OptionID, outcome.Name))
+				b.appendLog(fmt.Sprintf("Option %d already traded this session — skipping (NoDuplicates, forced)", outcome.OptionID))
 				return
 			}
 			ranked := strategy.RankByProximity(market.Outcomes, spot)
@@ -300,36 +502,22 @@ func (b *Bot) tick(ctx context.Context) {
 				b.appendLog("All ranges already traded this session — skipping (NoDuplicates)")
 				return
 			}
-			b.appendLog(fmt.Sprintf("Option %d (range=%s) already traded — falling back to option %d (range=%s)",
-				outcome.OptionID, outcome.Name, fallback.OptionID, fallback.Name))
+			b.appendLog(fmt.Sprintf("Option %d already traded — falling back to option %d (range=%s)",
+				outcome.OptionID, fallback.OptionID, fallback.Name))
 			outcome = fallback
 		}
 	}
 
-	// Guard: max wallet percentage
 	if b.cfg.MaxWalletPct > 0 {
-		estimatedCostMillisats := outcome.YesPriceMillisats * int64(b.cfg.Contracts)
-		walletMillisats := wallet.Balance
-		maxAllowedMillisats := walletMillisats * int64(b.cfg.MaxWalletPct) / 100
-		if estimatedCostMillisats > maxAllowedMillisats {
+		estimatedCostMs := outcome.YesPriceMillisats * int64(b.cfg.Contracts)
+		maxAllowedMs := wallet.Balance * int64(b.cfg.MaxWalletPct) / 100
+		if estimatedCostMs > maxAllowedMs {
 			b.appendLog(fmt.Sprintf(
 				"Trade cost ~%dsats exceeds %d%% wallet limit (%dsats) — skipping",
-				estimatedCostMillisats/1000,
-				b.cfg.MaxWalletPct,
-				maxAllowedMillisats/1000,
-			))
+				estimatedCostMs/1000, b.cfg.MaxWalletPct, maxAllowedMs/1000))
 			return
 		}
 	}
-
-	// Update shared state
-	b.mu.Lock()
-	b.state.LastSpot = spot
-	b.state.LastFng = fng
-	b.state.LastFngLabel = fngLabel
-	b.state.WalletBalance = wallet.Balance / 1000 // millisats → sats for display
-	b.state.LastError = ""
-	b.mu.Unlock()
 
 	timeUntil := time.Until(expiry).Round(time.Second)
 	b.appendLog(fmt.Sprintf(
@@ -339,10 +527,7 @@ func (b *Bot) tick(ctx context.Context) {
 
 	tradeReq := api.TradeRequest{
 		Topics: []api.TopicTrade{
-			{
-				TopicID: b.cfg.TopicID,
-				Legs:    []api.Leg{{OptionID: outcome.OptionID, Contracts: b.cfg.Contracts}},
-			},
+			{TopicID: b.cfg.TopicID, Legs: []api.Leg{{OptionID: outcome.OptionID, Contracts: b.cfg.Contracts}}},
 		},
 	}
 
@@ -360,7 +545,6 @@ func (b *Bot) tick(ctx context.Context) {
 		b.setError(fmt.Sprintf("placing trade: %v", err))
 		return
 	}
-
 	if resp.TopicsFailed > 0 {
 		b.setError(fmt.Sprintf("trade rejected (topics_failed=%d): %+v", resp.TopicsFailed, resp))
 		log.Printf("[BOT] trade rejected: %+v", resp)
@@ -384,9 +568,7 @@ func (b *Bot) tick(ctx context.Context) {
 		CostMillisats:       costMs,
 		CommissionMillisats: commMs,
 		Timestamp:           time.Now(),
-		DryRun:              false,
 	}
-
 	b.mu.Lock()
 	b.tradelog = append(b.tradelog, record)
 	b.tradedOptions[outcome.OptionID] = true
@@ -414,7 +596,6 @@ func (b *Bot) executeDryRun(outcome *api.Outcome, spot float64, fng int) {
 		Timestamp: time.Now(),
 		DryRun:    true,
 	}
-
 	b.mu.Lock()
 	b.tradelog = append(b.tradelog, record)
 	b.tradedOptions[outcome.OptionID] = true

@@ -116,16 +116,20 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		TopicID         int    `json:"topic_id"`
-		Contracts       int    `json:"contracts"`
-		Strategy        string `json:"strategy"`
-		PollSec         int    `json:"poll_sec"`
-		MaxTrades       int    `json:"max_trades"`
-		DryRun          bool   `json:"dry_run"`
-		MinExpiryMins   int    `json:"min_expiry_mins"`
-		MaxWalletPct    int    `json:"max_wallet_pct"`
-		NoDuplicates    bool   `json:"no_duplicates"`
-		ForcedOptionID  int    `json:"forced_option_id"`
+		TopicID        int     `json:"topic_id"`
+		Contracts      int     `json:"contracts"`
+		Strategy       string  `json:"strategy"`
+		PollSec        int     `json:"poll_sec"`
+		MaxTrades      int     `json:"max_trades"`
+		DryRun         bool    `json:"dry_run"`
+		MinExpiryMins  int     `json:"min_expiry_mins"`
+		MaxWalletPct   int     `json:"max_wallet_pct"`
+		NoDuplicates   bool    `json:"no_duplicates"`
+		ForcedOptionID int     `json:"forced_option_id"`
+		// Kelly mode — set "model" to activate the 4-stage QLS-LMSR pipeline
+		Model         string  `json:"model"`         
+		SigmaPct      float64 `json:"sigma_pct"`    
+		KellyFraction float64 `json:"kelly_fraction"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		errJSON(w, fmt.Sprintf("invalid body: %v", err), http.StatusBadRequest)
@@ -137,9 +141,6 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Contracts == 0 {
 		req.Contracts = h.cfg.Contracts
-	}
-	if req.Strategy == "" {
-		req.Strategy = h.cfg.Strategy
 	}
 	if req.PollSec == 0 {
 		req.PollSec = h.cfg.PollSec
@@ -154,10 +155,24 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		req.MaxWalletPct = h.cfg.MaxWalletPct
 	}
 
-	strat, err := strategy.FromName(req.Strategy)
-	if err != nil {
-		errJSON(w, err.Error(), http.StatusBadRequest)
-		return
+	// Decide mode: Kelly when "model" is provided, otherwise strategy
+	var strat strategy.Strategy
+	if req.Model == "" {
+		// Strategy mode (existing behaviour)
+		if req.Strategy == "" {
+			req.Strategy = h.cfg.Strategy
+		}
+		var err error
+		strat, err = strategy.FromName(req.Strategy)
+		if err != nil {
+			errJSON(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	} else {
+		// Kelly mode — apply default Kelly fraction if caller omitted it
+		if req.KellyFraction <= 0 {
+			req.KellyFraction = 0.25
+		}
 	}
 
 	cfg := bot.BotConfig{
@@ -170,6 +185,9 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		MaxWalletPct:   req.MaxWalletPct,
 		NoDuplicates:   req.NoDuplicates,
 		ForcedOptionID: req.ForcedOptionID,
+		ModelName:      req.Model,
+		SigmaPct:       req.SigmaPct,
+		KellyFraction:  req.KellyFraction,
 	}
 
 	h.mu.Lock()
