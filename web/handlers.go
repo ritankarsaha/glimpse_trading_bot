@@ -127,9 +127,13 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		NoDuplicates   bool    `json:"no_duplicates"`
 		ForcedOptionID int     `json:"forced_option_id"`
 		// Kelly mode — set "model" to activate the 4-stage QLS-LMSR pipeline
-		Model         string  `json:"model"`         
-		SigmaPct      float64 `json:"sigma_pct"`    
+		Model         string  `json:"model"`
+		ModelURL      string  `json:"model_url"`
+		SigmaPct      float64 `json:"sigma_pct"`
 		KellyFraction float64 `json:"kelly_fraction"`
+		AnnualVolPct  float64 `json:"annual_vol_pct"`
+		MinEdge       float64 `json:"min_edge"`
+		MaxBins       int     `json:"max_bins"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		errJSON(w, fmt.Sprintf("invalid body: %v", err), http.StatusBadRequest)
@@ -153,6 +157,20 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.MaxWalletPct == 0 {
 		req.MaxWalletPct = h.cfg.MaxWalletPct
+	}
+
+	// Apply config defaults for omitted model params
+	if req.ModelURL == "" && h.cfg.ModelURL != "" {
+		req.ModelURL = h.cfg.ModelURL
+	}
+	if req.AnnualVolPct == 0 {
+		req.AnnualVolPct = h.cfg.AnnualVolPct
+	}
+	if req.MinEdge == 0 {
+		req.MinEdge = h.cfg.MinEdge
+	}
+	if req.MaxBins == 0 {
+		req.MaxBins = h.cfg.MaxBins
 	}
 
 	// Decide mode: Kelly when "model" is provided, otherwise strategy
@@ -186,8 +204,12 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		NoDuplicates:   req.NoDuplicates,
 		ForcedOptionID: req.ForcedOptionID,
 		ModelName:      req.Model,
+		ModelURL:       req.ModelURL,
 		SigmaPct:       req.SigmaPct,
 		KellyFraction:  req.KellyFraction,
+		AnnualVolPct:   req.AnnualVolPct,
+		MinEdge:        req.MinEdge,
+		MaxBins:        req.MaxBins,
 	}
 
 	h.mu.Lock()

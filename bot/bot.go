@@ -9,6 +9,7 @@ import (
 
 	"github.com/ritankarsaha/glimpse-bot/api"
 	"github.com/ritankarsaha/glimpse-bot/kelly"
+	"github.com/ritankarsaha/glimpse-bot/lmsr"
 	"github.com/ritankarsaha/glimpse-bot/model"
 	"github.com/ritankarsaha/glimpse-bot/strategy"
 )
@@ -25,9 +26,13 @@ type BotConfig struct {
 	ForcedOptionID int 
 
 	// Kelly mode (activated when KellyFraction > 0)
-	ModelName     string 
-	SigmaPct      float64 
-	KellyFraction float64 
+	ModelName     string
+	ModelURL      string  // HTTP forecaster endpoint; takes precedence over ModelName when set
+	SigmaPct      float64
+	KellyFraction float64
+	AnnualVolPct  float64 // annualised vol in %; 0 falls back to SigmaPct
+	MinEdge       float64 // minimum edge threshold; 0 uses kelly.DefaultConfig value
+	MaxBins       int     // max bins per Kelly round; 0 uses kelly.DefaultConfig value
 }
 
 type KellyTradeSummary struct {
@@ -114,7 +119,10 @@ func (b *Bot) Start() error {
 	}
 
 	if b.cfg.KellyFraction > 0 {
-		name := b.cfg.ModelName
+		name := b.cfg.ModelURL // HTTP endpoint takes precedence
+		if name == "" {
+			name = b.cfg.ModelName
+		}
 		if name == "" {
 			name = "gaussian"
 		}
@@ -129,6 +137,12 @@ func (b *Bot) Start() error {
 		b.forecaster = f
 		b.kellyCfg = kelly.DefaultConfig()
 		b.kellyCfg.KellyFraction = b.cfg.KellyFraction
+		if b.cfg.MinEdge > 0 {
+			b.kellyCfg.MinEdge = b.cfg.MinEdge
+		}
+		if b.cfg.MaxBins > 0 {
+			b.kellyCfg.MaxBins = b.cfg.MaxBins
+		}
 	}
 
 	b.state = BotState{
@@ -265,6 +279,10 @@ func (b *Bot) tick(_ context.Context) {
 			b.setPaused("JWT expired — paste a fresh token in the UI")
 			return
 		}
+		if api.IsTransient(err) {
+			b.appendLog(fmt.Sprintf("[TRANSIENT] wallet: %v — will retry next tick", err))
+			return
+		}
 		b.setError(fmt.Sprintf("fetching wallet: %v", err))
 		return
 	}
@@ -280,6 +298,10 @@ func (b *Bot) tick(_ context.Context) {
 	if err != nil {
 		if api.IsUnauthorized(err) {
 			b.setPaused("JWT expired — paste a fresh token in the UI")
+			return
+		}
+		if api.IsTransient(err) {
+			b.appendLog(fmt.Sprintf("[TRANSIENT] quotes: %v — will retry next tick", err))
 			return
 		}
 		b.setError(fmt.Sprintf("fetching quotes for topic %d: %v", b.cfg.TopicID, err))
@@ -325,7 +347,14 @@ func (b *Bot) tickKelly(spot float64, fng int, fngLabel string, wallet *api.Wall
 
 	om := kelly.BuildOutcomeMap(market.Outcomes)
 
-	mdlProbs, err := b.forecaster.Forecast(spot, fng)
+	fctx := model.ForecastContext{
+		SpotPrice:      spot,
+		FearGreedIndex: fng,
+		TimeToExpiry:   time.Until(expiry),
+		ImpliedProbs:   lmsr.ImpliedProbs(om.Q),
+		RealizedVolAnn: b.cfg.AnnualVolPct / 100.0,
+	}
+	mdlProbs, err := b.forecaster.Forecast(fctx)
 	if err != nil {
 		b.setError(fmt.Sprintf("forecast: %v", err))
 		return
@@ -376,6 +405,10 @@ func (b *Bot) tickKelly(spot float64, fng int, fngLabel string, wallet *api.Wall
 	if err != nil {
 		if api.IsUnauthorized(err) {
 			b.setPaused("JWT expired — paste a fresh token in the UI")
+			return
+		}
+		if api.IsTransient(err) {
+			b.appendLog(fmt.Sprintf("[TRANSIENT] place trade: %v — will retry next tick", err))
 			return
 		}
 		b.setError(fmt.Sprintf("placing kelly trade: %v", err))
@@ -540,6 +573,10 @@ func (b *Bot) tickStrategy(spot float64, fng int, fngLabel string, wallet *api.W
 	if err != nil {
 		if api.IsUnauthorized(err) {
 			b.setPaused("JWT expired — paste a fresh token in the UI")
+			return
+		}
+		if api.IsTransient(err) {
+			b.appendLog(fmt.Sprintf("[TRANSIENT] place trade: %v — will retry next tick", err))
 			return
 		}
 		b.setError(fmt.Sprintf("placing trade: %v", err))

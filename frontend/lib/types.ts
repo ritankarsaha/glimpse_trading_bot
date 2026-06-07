@@ -76,8 +76,12 @@ export interface StartPayload {
   forced_option_id: number;
   // Kelly mode
   model?: string;
+  model_url?: string;
   sigma_pct?: number;
+  annual_vol_pct?: number;
   kelly_fraction?: number;
+  min_edge?: number;
+  max_bins?: number;
 }
 
 export interface QuickTradePayload {

@@ -72,12 +72,13 @@ type state struct {
 }
 
 type TUI struct {
-	client    *api.GlimpseClient
+	client     *api.GlimpseClient
 	forecaster model.Forecaster
-	kellyCfg  kelly.Config
-	topicID   int
-	pollSec   int
-	dryRun    bool
+	kellyCfg   kelly.Config
+	topicID    int
+	pollSec    int
+	dryRun     bool
+	annualVol  float64 // annualised vol fraction, e.g. 0.65 for 65%
 
 	mu     sync.Mutex
 	st     state
@@ -87,11 +88,12 @@ type TUI struct {
 
 // Config for the TUI bot session
 type Config struct {
-	TopicID   int
-	PollSec   int
-	DryRun    bool
-	Model     model.Forecaster
-	KellyCfg  kelly.Config
+	TopicID      int
+	PollSec      int
+	DryRun       bool
+	Model        model.Forecaster
+	KellyCfg     kelly.Config
+	AnnualVolPct float64 // annualised BTC vol in %; 0 falls back to model's SigmaPct default
 }
 
 // New creates a TUI instance. Call Run() to start
@@ -103,6 +105,7 @@ func New(client *api.GlimpseClient, cfg Config) *TUI {
 		topicID:    cfg.TopicID,
 		pollSec:    cfg.PollSec,
 		dryRun:     cfg.DryRun,
+		annualVol:  cfg.AnnualVolPct / 100.0,
 		keys:       make(chan byte, 4),
 	}
 }
@@ -246,8 +249,17 @@ func (t *TUI) tick() {
 	// Market-implied probs
 	mktProbs := lmsr.ImpliedProbs(om.Q)
 
+	expiry := time.Unix(market.MarketEndTimeUTC, 0)
+
 	// Forecast
-	mdlProbs, err := t.forecaster.Forecast(spot, fng)
+	fctx := model.ForecastContext{
+		SpotPrice:      spot,
+		FearGreedIndex: fng,
+		TimeToExpiry:   time.Until(expiry),
+		ImpliedProbs:   mktProbs,
+		RealizedVolAnn: t.annualVol,
+	}
+	mdlProbs, err := t.forecaster.Forecast(fctx)
 	if err != nil {
 		t.setErr("forecast: " + err.Error())
 		return
@@ -280,7 +292,6 @@ func (t *TUI) tick() {
 	}
 
 	// Update state
-	expiry := time.Unix(market.MarketEndTimeUTC, 0)
 	t.mu.Lock()
 	t.st.spot = spot
 	t.st.fng = fng

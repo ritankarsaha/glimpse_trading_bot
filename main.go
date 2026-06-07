@@ -23,9 +23,10 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	tuiMode := flag.Bool("tui", false, "launch Bloomberg-style terminal UI instead of web server")
-	tuiModel := flag.String("model", "gaussian", "forecast model: gaussian, skewed, uniform, or a JSON file path")
+	tuiModel := flag.String("model", "", "forecast model: gaussian, skewed, uniform, lognormal, or a JSON/HTTP path (default from config)")
 	tuiSigma := flag.Float64("sigma", 5.0, "Gaussian σ as %% of spot price (used by gaussian/skewed models)")
-	tuiKelly := flag.Float64("kelly", 0.25, "Kelly fraction c (0 < c ≤ 1; 0.25 = quarter-Kelly)")
+	tuiKelly := flag.Float64("kelly", 0.0, "Kelly fraction c (0 < c ≤ 1; 0.25 = quarter-Kelly; 0 = use config default)")
+	tuiAnnualVol := flag.Float64("annual-vol", 0.0, "BTC annualised vol in %% (e.g. 65.0 for 65%%; 0 = use config default)")
 	flag.Parse()
 
 	cfg, err := config.Load()
@@ -36,7 +37,19 @@ func main() {
 	client := api.NewGlimpseClient(cfg.Token)
 
 	if *tuiMode {
-		runTUI(client, cfg, *tuiModel, *tuiSigma, *tuiKelly)
+		modelName := *tuiModel
+		if modelName == "" {
+			modelName = cfg.ModelName
+		}
+		kellyFrac := *tuiKelly
+		if kellyFrac <= 0 {
+			kellyFrac = cfg.KellyFraction
+		}
+		annualVol := *tuiAnnualVol
+		if annualVol <= 0 {
+			annualVol = cfg.AnnualVolPct
+		}
+		runTUI(client, cfg, modelName, *tuiSigma, kellyFrac, annualVol)
 		return
 	}
 
@@ -80,7 +93,7 @@ func main() {
 	log.Println("[main] Server stopped. Goodbye.")
 }
 
-func runTUI(client *api.GlimpseClient, cfg *config.Config, modelName string, sigma, kellyFrac float64) {
+func runTUI(client *api.GlimpseClient, cfg *config.Config, modelName string, sigma, kellyFrac, annualVol float64) {
 	if cfg.Token == "" {
 		fmt.Fprintln(os.Stderr, "No JWT token configured. Set GLIMPSE_TOKEN or add token to config.json.")
 		os.Exit(1)
@@ -94,13 +107,20 @@ func runTUI(client *api.GlimpseClient, cfg *config.Config, modelName string, sig
 
 	kellyCfg := kelly.DefaultConfig()
 	kellyCfg.KellyFraction = kellyFrac
+	if cfg.MinEdge > 0 {
+		kellyCfg.MinEdge = cfg.MinEdge
+	}
+	if cfg.MaxBins > 0 {
+		kellyCfg.MaxBins = cfg.MaxBins
+	}
 
 	t := tui.New(client, tui.Config{
-		TopicID:  cfg.TopicID,
-		PollSec:  cfg.PollSec,
-		DryRun:   cfg.DryRun,
-		Model:    forecaster,
-		KellyCfg: kellyCfg,
+		TopicID:      cfg.TopicID,
+		PollSec:      cfg.PollSec,
+		DryRun:       cfg.DryRun,
+		Model:        forecaster,
+		KellyCfg:     kellyCfg,
+		AnnualVolPct: annualVol,
 	})
 	if err := t.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tui error: %v\n", err)

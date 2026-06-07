@@ -21,9 +21,10 @@ const STRATEGIES = [
 ] as const;
 
 const MODELS = [
-  { value: 'gaussian', label: 'Gaussian',        desc: 'Normal distribution centred on spot price. σ controls the spread.' },
-  { value: 'skewed',   label: 'Skewed Gaussian', desc: 'Gaussian shifted by Fear & Greed index — contrarian (fear → bullish, greed → bearish).' },
-  { value: 'uniform',  label: 'Uniform',         desc: 'Equal probability across all 500 bins. Useful as a baseline / stress-test.' },
+  { value: 'gaussian',  label: 'Gaussian',        desc: 'Normal distribution centred on spot price. σ controls the spread.' },
+  { value: 'skewed',    label: 'Skewed Gaussian', desc: 'Gaussian shifted by Fear & Greed index — contrarian (fear → bullish, greed → bearish).' },
+  { value: 'lognormal', label: 'Log-Normal',      desc: 'log(P_T) ~ N(log(S)−σ²T/2, σ²T). Right-skewed, correct for asset prices. Uses annual vol + time-to-expiry automatically.' },
+  { value: 'uniform',   label: 'Uniform',         desc: 'Equal probability across all 500 bins. Useful as a baseline / stress-test.' },
 ] as const;
 
 function fmtExpiry(endTimeUtc: number): string {
@@ -65,6 +66,7 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
 
   const [model, setModel] = useState('gaussian');
   const [sigmaPct, setSigmaPct] = useState(5);
+  const [annualVolPct, setAnnualVolPct] = useState(65);
   const [kellyFraction, setKellyFraction] = useState(0.25);
 
   const [pollSec, setPollSec] = useState(60);
@@ -143,6 +145,7 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
           forced_option_id: 0,
           model,
           sigma_pct: sigmaPct,
+          annual_vol_pct: annualVolPct,
           kelly_fraction: kellyFraction,
         });
       } else {
@@ -233,21 +236,28 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
       <div className="mb-3.5">
         <label className="field-label">Market</label>
         <div className="flex gap-2 items-center">
-          <select
-            value={selectedMarket}
-            onChange={(e) => setSelectedMarket(e.target.value)}
-            className="field-input flex-1 cursor-pointer"
-          >
-            {markets.length === 0 ? (
-              <option value="">— paste token then click Load —</option>
-            ) : (
-              markets.map((m) => (
+          {markets.length > 0 ? (
+            <select
+              value={selectedMarket}
+              onChange={(e) => setSelectedMarket(e.target.value)}
+              className="field-input flex-1 cursor-pointer"
+            >
+              {markets.map((m) => (
                 <option key={m.topic_id} value={m.topic_id}>
                   #{m.topic_id} — {m.title} ({fmtExpiry(m.end_time_utc)})
                 </option>
-              ))
-            )}
-          </select>
+              ))}
+            </select>
+          ) : (
+            <input
+              type="number"
+              value={selectedMarket}
+              onChange={(e) => setSelectedMarket(e.target.value)}
+              placeholder="Enter topic ID (e.g. 1116)"
+              className="field-input flex-1"
+              min={1}
+            />
+          )}
           <button
             onClick={handleLoadMarkets}
             disabled={loadingMarkets}
@@ -256,6 +266,9 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
             {loadingMarkets ? 'Loading…' : 'Load ↻'}
           </button>
         </div>
+        {markets.length === 0 && !marketHint && (
+          <p className="text-[11px] mt-1 text-[#555]">Type a topic ID directly if Load fails — find it in the Glimpse URL or DevTools.</p>
+        )}
         {marketHint && <p className={`text-[11px] mt-1 ${marketHintColor}`}>{marketHint}</p>}
       </div>
 
@@ -319,11 +332,22 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
             {selectedModelDesc && <p className="text-[11px] text-[#00c48c]/60 mt-1 leading-relaxed">{selectedModelDesc}</p>}
           </div>
 
+          <div className="mb-3.5">
+            <label className="field-label">
+              Annualised volatility (%)
+              <Tooltip text="BTC annualised vol used by Gaussian and Log-Normal models to compute σ = spot × vol × √(T/1yr). Historical BTC vol is ~60–80%. Overrides the fixed σ% below when set." />
+            </label>
+            <div className="flex items-center gap-2.5">
+              <input type="range" min={10} max={150} step={5} value={annualVolPct} onChange={(e) => setAnnualVolPct(Number(e.target.value))} className="flex-1 accent-[#00c48c]" />
+              <span className="font-mono text-[13px] text-[#00c48c] min-w-[36px] text-right">{annualVolPct}%</span>
+            </div>
+          </div>
+
           {(model === 'gaussian' || model === 'skewed') && (
             <div className="mb-3.5">
               <label className="field-label">
-                σ — standard deviation (% of spot)
-                <Tooltip text="Width of the Gaussian forecast. 5% at $80k = ±$4000. Wider σ = more bins marked as uncertain = fewer trades." />
+                σ fallback (% of spot, used when vol+time unavailable)
+                <Tooltip text="Fallback width of the Gaussian forecast when time-to-expiry is unknown. 5% at $80k = ±$4000." />
               </label>
               <div className="flex items-center gap-2.5">
                 <input type="range" min={1} max={20} step={0.5} value={sigmaPct} onChange={(e) => setSigmaPct(Number(e.target.value))} className="flex-1 accent-[#00c48c]" />

@@ -28,12 +28,33 @@ type APIError struct {
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("API error %d: %s", e.StatusCode, e.Body)
+	body := e.Body
+	// Strip HTML bodies (e.g. nginx 502 pages) — keep only the first line
+	if len(body) > 80 || (len(body) > 0 && body[0] == '<') {
+		switch e.StatusCode {
+		case 502:
+			body = "exchange gateway temporarily unavailable"
+		case 503:
+			body = "exchange service temporarily unavailable"
+		case 504:
+			body = "exchange gateway timed out"
+		default:
+			body = fmt.Sprintf("server error (body too long or HTML, %d bytes)", len(body))
+		}
+	}
+	return fmt.Sprintf("API error %d: %s", e.StatusCode, body)
 }
 
 func IsUnauthorized(err error) bool {
 	var apiErr *APIError
 	return errors.As(err, &apiErr) && apiErr.StatusCode == 401
+}
+
+// IsTransient returns true for errors that are likely temporary (5xx from the exchange).
+// The bot should log and skip the tick rather than stopping.
+func IsTransient(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode >= 500
 }
 
 // GlimpseClient handles all API communication
@@ -71,8 +92,18 @@ func (c *GlimpseClient) getToken() string {
 }
 
 func (c *GlimpseClient) request(method, url string, body []byte, glimpseAuth bool) ([]byte, int, error) {
+	return c.requestN(method, url, body, glimpseAuth, maxRetries)
+}
+
+// requestFast makes a single attempt with no retry — used by per-tick bot calls so a
+// sustained exchange outage doesn't block the goroutine for tens of seconds.
+func (c *GlimpseClient) requestFast(method, url string, body []byte, glimpseAuth bool) ([]byte, int, error) {
+	return c.requestN(method, url, body, glimpseAuth, fastRetries)
+}
+
+func (c *GlimpseClient) requestN(method, url string, body []byte, glimpseAuth bool, maxAttempts int) ([]byte, int, error) {
 	var lastErr error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		var bodyReader io.Reader
 		if len(body) > 0 {
 			bodyReader = bytes.NewReader(body)
@@ -97,20 +128,22 @@ func (c *GlimpseClient) request(method, url string, body []byte, glimpseAuth boo
 		log.Printf("[API] %s %s (attempt %d/%d)", method, url, attempt, maxRetries)
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			log.Printf("[API] network error (attempt %d): %v", attempt, err)
+			delay := retryBaseDelay * (1 << (attempt - 1))
+			log.Printf("[API] network error (attempt %d): %v — retrying in %s", attempt, err, delay)
 			lastErr = err
-			if attempt < maxRetries {
-				time.Sleep(retryDelay)
+			if attempt < maxAttempts {
+				time.Sleep(delay)
 			}
 			continue
 		}
 
 		log.Printf("[API] %s %s → %d", method, url, resp.StatusCode)
 
-		if resp.StatusCode >= 500 && attempt < maxRetries {
+		if resp.StatusCode >= 500 && attempt < maxAttempts {
 			resp.Body.Close()
-			log.Printf("[API] server error %d, retrying in %s", resp.StatusCode, retryDelay)
-			time.Sleep(retryDelay)
+			delay := retryBaseDelay * (1 << (attempt - 1))
+			log.Printf("[API] server error %d, retrying in %s (attempt %d/%d)", resp.StatusCode, delay, attempt, maxAttempts)
+			time.Sleep(delay)
 			continue
 		}
 
@@ -124,14 +157,24 @@ func (c *GlimpseClient) request(method, url string, body []byte, glimpseAuth boo
 	}
 
 	if lastErr != nil {
-		return nil, 0, fmt.Errorf("request failed after %d attempts: %w", maxRetries, lastErr)
+		return nil, 0, fmt.Errorf("request failed after %d attempts: %w", maxAttempts, lastErr)
 	}
-	return nil, 0, fmt.Errorf("request failed after %d attempts", maxRetries)
+	return nil, 0, fmt.Errorf("request failed after %d attempts", maxAttempts)
 }
 
 func (c *GlimpseClient) glimpseGET(path string, out interface{}) error {
+	return c.glimpseGETN(path, out, maxRetries)
+}
+
+// glimpseGETFast makes a single attempt — for bot per-tick calls where a sustained
+// outage should fail fast and retry on the next poll interval, not block for 30s.
+func (c *GlimpseClient) glimpseGETFast(path string, out interface{}) error {
+	return c.glimpseGETN(path, out, fastRetries)
+}
+
+func (c *GlimpseClient) glimpseGETN(path string, out interface{}, attempts int) error {
 	url := c.baseURL + path
-	body, status, err := c.request(http.MethodGet, url, nil, true)
+	body, status, err := c.requestN(http.MethodGet, url, nil, true, attempts)
 	if err != nil {
 		return err
 	}
@@ -142,12 +185,21 @@ func (c *GlimpseClient) glimpseGET(path string, out interface{}) error {
 }
 
 func (c *GlimpseClient) glimpsePOST(path string, payload, out interface{}) error {
+	return c.glimpsePOSTN(path, payload, out, maxRetries)
+}
+
+// glimpsePOSTFast makes a single attempt — for bot trade execution during tick.
+func (c *GlimpseClient) glimpsePOSTFast(path string, payload, out interface{}) error {
+	return c.glimpsePOSTN(path, payload, out, fastRetries)
+}
+
+func (c *GlimpseClient) glimpsePOSTN(path string, payload, out interface{}, attempts int) error {
 	reqBody, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshalling request: %w", err)
 	}
 	url := c.baseURL + path
-	body, status, err := c.request(http.MethodPost, url, reqBody, true)
+	body, status, err := c.requestN(http.MethodPost, url, reqBody, true, attempts)
 	if err != nil {
 		return err
 	}
@@ -219,19 +271,19 @@ func apiTruncate(b []byte, n int) string {
 	return s[:n] + "…"
 }
 
-// GetQuotes fetches live quotes for a market topic
+// GetQuotes fetches live quotes — uses fast path (1 attempt) for bot tick calls.
 func (c *GlimpseClient) GetQuotes(topicID int) (*Market, error) {
 	var m Market
-	if err := c.glimpseGET(fmt.Sprintf("/nmarket/markets/%d/quotes", topicID), &m); err != nil {
+	if err := c.glimpseGETFast(fmt.Sprintf("/nmarket/markets/%d/quotes", topicID), &m); err != nil {
 		return nil, err
 	}
 	return &m, nil
 }
 
-// PlaceTrade submits a multi-leg trade
+// PlaceTrade submits a multi-leg trade — uses fast path; caller handles retry via next tick.
 func (c *GlimpseClient) PlaceTrade(req TradeRequest) (*TradeResponse, error) {
 	var resp TradeResponse
-	if err := c.glimpsePOST("/nmarket/enter-multi-topic-multi-leg", req, &resp); err != nil {
+	if err := c.glimpsePOSTFast("/nmarket/enter-multi-topic-multi-leg", req, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
@@ -239,7 +291,7 @@ func (c *GlimpseClient) PlaceTrade(req TradeRequest) (*TradeResponse, error) {
 
 func (c *GlimpseClient) GetWalletBalance() (*WalletBalance, error) {
 	var wb WalletBalance
-	if err := c.glimpseGET("/wallet-balance", &wb); err != nil {
+	if err := c.glimpseGETFast("/wallet-balance", &wb); err != nil {
 		return nil, err
 	}
 	return &wb, nil

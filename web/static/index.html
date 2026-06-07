@@ -5,19 +5,120 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Glimpse Kelly Bot</title>
   <style>
-    body { font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 20px; }
-    h1 { color: #58a6ff; }
-    .tip { color: #8b949e; margin-top: 20px; }
+    * { box-sizing: border-box; }
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px; max-width: 900px; }
+    h1 { color: #58a6ff; margin-bottom: 4px; }
+    h2 { color: #79c0ff; margin-top: 28px; margin-bottom: 8px; font-size: 1em; text-transform: uppercase; letter-spacing: 1px; }
+    p, li { color: #8b949e; line-height: 1.6; }
     code { background: #161b22; padding: 2px 6px; border-radius: 4px; color: #79c0ff; }
+    pre { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 14px 16px; overflow-x: auto; color: #c9d1d9; font-size: 0.88em; line-height: 1.5; }
+    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+    th { text-align: left; color: #58a6ff; font-weight: normal; padding: 4px 10px; border-bottom: 1px solid #30363d; }
+    td { padding: 4px 10px; border-bottom: 1px solid #21262d; color: #8b949e; }
+    td:first-child { color: #79c0ff; }
+    .badge { display: inline-block; background: #1f6feb; color: #fff; padding: 1px 6px; border-radius: 4px; font-size: 0.78em; margin-left: 6px; vertical-align: middle; }
+    .section { border-top: 1px solid #21262d; margin-top: 28px; padding-top: 16px; }
   </style>
 </head>
 <body>
   <h1>Glimpse Kelly Bot</h1>
-  <p>API endpoints are live. Use the REST API or launch the TUI mode:</p>
-  <pre>./glimpse-bot --tui --model gaussian --sigma 5 --kelly 0.25</pre>
-  <p class="tip">Available endpoints: <code>/api/status</code> <code>/api/markets</code>
-    <code>/api/quotes?topic_id=N</code> <code>/api/wallet</code>
-    <code>/api/start</code> <code>/api/stop</code> <code>/api/spot</code>
-    <code>/api/quicktrade</code></p>
+  <p>QLS-LMSR prediction market trading bot. API is live — use the endpoints below or launch TUI mode.</p>
+
+  <div class="section">
+    <h2>TUI Mode</h2>
+    <pre>./glimpse-bot --tui --model lognormal --annual-vol 65 --kelly 0.25
+./glimpse-bot --tui --model gaussian  --sigma 5    --kelly 0.25
+./glimpse-bot --tui --model http://localhost:9000/forecast --kelly 0.25</pre>
+    <table>
+      <tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+      <tr><td>--model</td><td>gaussian</td><td>gaussian | skewed | uniform | lognormal | http(s)://… | /path/to.json</td></tr>
+      <tr><td>--annual-vol</td><td>65.0</td><td>Annualised BTC vol in % (used by gaussian & lognormal when vol+time available)</td></tr>
+      <tr><td>--sigma</td><td>5.0</td><td>Gaussian σ as % of spot — fallback when annual-vol is not set</td></tr>
+      <tr><td>--kelly</td><td>0.25</td><td>Kelly fraction (0 &lt; c ≤ 1; 0.25 = quarter-Kelly)</td></tr>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>Endpoints</h2>
+    <table>
+      <tr><th>Method</th><th>Path</th><th>Description</th></tr>
+      <tr><td>GET</td><td><code>/api/ping</code></td><td>Health check</td></tr>
+      <tr><td>GET</td><td><code>/api/status</code></td><td>Bot state (model, Kelly trades, logs, balance)</td></tr>
+      <tr><td>GET</td><td><code>/api/trades</code></td><td>Session trade log</td></tr>
+      <tr><td>GET</td><td><code>/api/spot</code></td><td>Live BTC spot price</td></tr>
+      <tr><td>GET</td><td><code>/api/wallet</code></td><td>Wallet balance</td></tr>
+      <tr><td>GET</td><td><code>/api/markets</code></td><td>Active markets</td></tr>
+      <tr><td>GET</td><td><code>/api/quotes?topic_id=N</code></td><td>Market outcomes + prices</td></tr>
+      <tr><td>POST</td><td><code>/api/start</code></td><td>Start bot session (see payload below)</td></tr>
+      <tr><td>POST</td><td><code>/api/stop</code></td><td>Stop running bot</td></tr>
+      <tr><td>POST</td><td><code>/api/token</code></td><td>Set JWT token</td></tr>
+      <tr><td>POST</td><td><code>/api/quicktrade</code></td><td>Single immediate trade</td></tr>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>POST /api/start — payload</h2>
+    <pre>{
+  "topic_id":       1116,
+  "contracts":      1,
+  "poll_sec":       60,
+  "max_trades":     5,
+  "dry_run":        true,
+  "min_expiry_mins": 10,
+  "max_wallet_pct": 10,
+  "no_duplicates":  true,
+
+  // Kelly mode — omit "model" to use strategy mode instead
+  "model":          "lognormal",   // gaussian | skewed | uniform | lognormal | https://…
+  "model_url":      "",            // HTTP forecaster URL — overrides "model" when set
+  "annual_vol_pct": 65.0,          // annualised vol in %; 0 = use config default
+  "kelly_fraction": 0.25,
+  "min_edge":       0.005,
+  "max_bins":       10,
+
+  // Strategy mode (when "model" is empty)
+  "strategy":       "nearest"      // nearest | feargreed | bestodds | followcrowd
+}</pre>
+  </div>
+
+  <div class="section">
+    <h2>Quick test commands</h2>
+    <pre># 1. Check server is up
+curl http://localhost:8080/api/ping
+
+# 2. Set your JWT token
+curl -X POST http://localhost:8080/api/token \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"YOUR_JWT_HERE"}'
+
+# 3. Start Kelly bot with log-normal model (dry run)
+curl -X POST http://localhost:8080/api/start \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"lognormal","annual_vol_pct":65,"kelly_fraction":0.25,"dry_run":true}'
+
+# 4. Start Kelly bot with external HTTP model
+curl -X POST http://localhost:8080/api/start \
+  -H 'Content-Type: application/json' \
+  -d '{"model_url":"http://localhost:9000/forecast","kelly_fraction":0.25,"dry_run":true}'
+
+# 5. Check bot state (model_name, kelly_trades, logs visible here)
+curl http://localhost:8080/api/status | python3 -m json.tool
+
+# 6. Stop bot
+curl -X POST http://localhost:8080/api/stop</pre>
+  </div>
+
+  <div class="section">
+    <h2>Models</h2>
+    <table>
+      <tr><th>Name</th><th>How to select</th><th>Notes</th></tr>
+      <tr><td>gaussian</td><td><code>"model":"gaussian"</code></td><td>Normal distribution centred on spot; vol-aware σ when annual_vol_pct + TimeToExpiry are set</td></tr>
+      <tr><td>skewed</td><td><code>"model":"skewed"</code></td><td>Gaussian shifted by Fear &amp; Greed index (contrarian)</td></tr>
+      <tr><td>uniform</td><td><code>"model":"uniform"</code></td><td>Flat prior — useful as a baseline</td></tr>
+      <tr><td>lognormal <span class="badge">new</span></td><td><code>"model":"lognormal"</code></td><td>log(P_T) ~ N(log(S)−σ²T/2, σ²T); right-skewed, correct for asset prices</td></tr>
+      <tr><td>HTTP <span class="badge">new</span></td><td><code>"model_url":"https://…"</code></td><td>POST ForecastContext JSON → receive 500 probabilities; plug in any Python/LSTM/ARIMA model</td></tr>
+      <tr><td>Ensemble <span class="badge">new</span></td><td>Programmatic only</td><td><code>NewEnsembleForecaster(models, weights)</code> — weighted blend of any forecasters</td></tr>
+    </table>
+  </div>
 </body>
 </html>
