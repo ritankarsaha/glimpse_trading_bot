@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	glimpseBase = "https://glimpesdev.bpmapi.io/api/v1"
+	glimpseBase = "https://www.glimpse.markets/api/v1"
 	coinbaseURL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 	fngURL      = "https://api.alternative.me/fng/?limit=1"
 	maxRetries  = 3
@@ -91,7 +91,7 @@ func (c *GlimpseClient) request(method, url string, body []byte, glimpseAuth boo
 			req.Header.Set("Origin", "https://www.glimpse.markets")
 			req.Header.Set("Referer", "https://www.glimpse.markets/")
 			req.Header.Set("sec-fetch-mode", "cors")
-			req.Header.Set("sec-fetch-site", "cross-site")
+			req.Header.Set("sec-fetch-site", "same-origin")
 		}
 
 		log.Printf("[API] %s %s (attempt %d/%d)", method, url, attempt, maxRetries)
