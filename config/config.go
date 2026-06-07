@@ -37,7 +37,7 @@ func Load() (*Config, error) {
 		PollSec:       60,
 		MaxTrades:     5,
 		DryRun:        true,
-		Port:          8080,
+		Port:          3002,
 		MinExpiryMins: 10,
 		MaxWalletPct:  10,
 		NoDuplicates:  true,

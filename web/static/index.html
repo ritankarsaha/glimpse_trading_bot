@@ -84,28 +84,28 @@
   <div class="section">
     <h2>Quick test commands</h2>
     <pre># 1. Check server is up
-curl http://localhost:8080/api/ping
+curl http://localhost:3002/api/ping
 
 # 2. Set your JWT token
-curl -X POST http://localhost:8080/api/token \
+curl -X POST http://localhost:3002/api/token \
   -H 'Content-Type: application/json' \
   -d '{"token":"YOUR_JWT_HERE"}'
 
 # 3. Start Kelly bot with log-normal model (dry run)
-curl -X POST http://localhost:8080/api/start \
+curl -X POST http://localhost:3002/api/start \
   -H 'Content-Type: application/json' \
   -d '{"model":"lognormal","annual_vol_pct":65,"kelly_fraction":0.25,"dry_run":true}'
 
 # 4. Start Kelly bot with external HTTP model
-curl -X POST http://localhost:8080/api/start \
+curl -X POST http://localhost:3002/api/start \
   -H 'Content-Type: application/json' \
   -d '{"model_url":"http://localhost:9000/forecast","kelly_fraction":0.25,"dry_run":true}'
 
 # 5. Check bot state (model_name, kelly_trades, logs visible here)
-curl http://localhost:8080/api/status | python3 -m json.tool
+curl http://localhost:3002/api/status | python3 -m json.tool
 
 # 6. Stop bot
-curl -X POST http://localhost:8080/api/stop</pre>
+curl -X POST http://localhost:3002/api/stop</pre>
   </div>
 
   <div class="section">
