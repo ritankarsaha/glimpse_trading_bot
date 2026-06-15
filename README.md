@@ -322,3 +322,9 @@ Bot mostly comes with a positive trade response
 <img width="621" height="446" alt="Screenshot 2026-05-25 at 2 09 31 AM" src="https://github.com/user-attachments/assets/ee455c2e-8291-4d80-9bea-d92e7a1c3f2b" />
 <img width="503" height="433" alt="Screenshot 2026-05-25 at 2 09 18 AM" src="https://github.com/user-attachments/assets/4398c08d-0d4d-43c4-a1db-df757d974467" />
 <img width="525" height="425" alt="Screenshot 2026-05-25 at 2 32 07 AM" src="https://github.com/user-attachments/assets/0e814df3-1416-4e32-8799-2eb597e29279" />
+
+
+## Portfolio with Bot 
+
+<img width="755" height="267" alt="Screenshot 2026-06-15 at 8 14 37 PM" src="https://github.com/user-attachments/assets/def55798-ea20-430b-a1d7-bbe9af729234" />
+
