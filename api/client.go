@@ -14,12 +14,14 @@ import (
 )
 
 const (
-	glimpseBase = "https://www.glimpse.markets/api/v1"
+	glimpseBase = "https://main.bpmapi.io/api/v1"
 	coinbaseURL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 	fngURL      = "https://api.alternative.me/fng/?limit=1"
-	maxRetries  = 3
-	retryDelay  = 2 * time.Second
-	reqTimeout  = 10 * time.Second
+	maxRetries     = 3
+	fastRetries    = 1
+	retryDelay     = 2 * time.Second
+	retryBaseDelay = retryDelay
+	reqTimeout     = 10 * time.Second
 )
 
 type APIError struct {
@@ -62,33 +64,33 @@ type GlimpseClient struct {
 	baseURL    string
 	httpClient *http.Client
 	mu         sync.RWMutex
-	token      string
+	apiKey     string
 }
 
-func NewGlimpseClient(token string) *GlimpseClient {
+func NewGlimpseClient(apiKey string) *GlimpseClient {
 	return &GlimpseClient{
 		baseURL:    glimpseBase,
 		httpClient: &http.Client{Timeout: reqTimeout},
-		token:      token,
+		apiKey:     apiKey,
 	}
 }
 
-func (c *GlimpseClient) SetToken(token string) {
+func (c *GlimpseClient) SetAPIKey(apiKey string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.token = token
+	c.apiKey = apiKey
 }
 
-func (c *GlimpseClient) HasToken() bool {
+func (c *GlimpseClient) HasAPIKey() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.token != ""
+	return c.apiKey != ""
 }
 
-func (c *GlimpseClient) getToken() string {
+func (c *GlimpseClient) getAPIKey() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.token
+	return c.apiKey
 }
 
 func (c *GlimpseClient) request(method, url string, body []byte, glimpseAuth bool) ([]byte, int, error) {
@@ -115,14 +117,11 @@ func (c *GlimpseClient) requestN(method, url string, body []byte, glimpseAuth bo
 		}
 
 		if glimpseAuth {
-			// Raw JWT
-			req.Header.Set("Authorization", c.getToken())
+			// Raw API key — Glimpse's Main Service takes the key directly in
+			// Authorization, no "Bearer " prefix.
+			req.Header.Set("Authorization", c.getAPIKey())
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Accept", "*/*")
-			req.Header.Set("Origin", "https://www.glimpse.markets")
-			req.Header.Set("Referer", "https://www.glimpse.markets/")
-			req.Header.Set("sec-fetch-mode", "cors")
-			req.Header.Set("sec-fetch-site", "same-origin")
+			req.Header.Set("Accept", "application/json")
 		}
 
 		log.Printf("[API] %s %s (attempt %d/%d)", method, url, attempt, maxRetries)
@@ -297,7 +296,7 @@ func (c *GlimpseClient) GetWalletBalance() (*WalletBalance, error) {
 	return &wb, nil
 }
 
-// GetTradesByTopic fetches trade history for a given topic
+// GetTradesByTopic fetches trade history for a given topic.
 func (c *GlimpseClient) GetTradesByTopic(topicID int) ([]interface{}, error) {
 	body, status, err := c.request(http.MethodGet,
 		fmt.Sprintf("%s/nmarket/trades-by-topic?topic_id=%d", c.baseURL, topicID),

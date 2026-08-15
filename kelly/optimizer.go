@@ -101,6 +101,10 @@ func Optimize(om *OutcomeMap, modelProbs []float64, budgetSats float64, cfg Conf
 
 	// market-implied probs + underpriced set A
 	mktPrices := lmsr.PriceVector(q)
+	sumMktPrices := 0.0
+	for _, p := range mktPrices {
+		sumMktPrices += p
+	}
 
 	type candidate struct {
 		idx  int
@@ -113,7 +117,13 @@ func Optimize(om *OutcomeMap, modelProbs []float64, budgetSats float64, cfg Conf
 		if _, ok := om.BinToOutcome[i]; !ok {
 			continue
 		}
-		mktP := mktPrices[i] / 100.0
+		// Glimpse's LS-LMSR price components don't sum to 100 (they sum to
+		// something that drifts with market state — 100·(V+1) at the
+		// uniform seed, trending toward 100 as a market concentrates). The
+		// platform's own normalization is price/Σprices, not price/100 —
+		// dividing by a flat 100 overstates the market-implied probability
+		// and makes real edges look smaller (or negative) than they are.
+		mktP := mktPrices[i] / sumMktPrices
 		mdlP := modelProbs[i]
 		edge := mdlP - mktP
 		if edge > cfg.MinEdge {
@@ -155,9 +165,13 @@ func Optimize(om *OutcomeMap, modelProbs []float64, budgetSats float64, cfg Conf
 		c1 := lmsr.CostFunction(qNew)
 		totalCost := (1 + cfg.Tau) * (c1 - c0)
 
+		// Settlement payout is 100 sats/contract with no fee — Glimpse's 2%
+		// fee applies only to buying/selling, not to automatic settlement —
+		// so the payout term is undiscounted (unlike totalCost above, which
+		// correctly includes the entry fee).
 		W := make([]float64, lmsr.N)
 		for j := 0; j < lmsr.N; j++ {
-			W[j] = budgetSats - totalCost + (1-cfg.Tau)*100.0*delta[j]
+			W[j] = budgetSats - totalCost + 100.0*delta[j]
 			if W[j] < 1.0 {
 				W[j] = 1.0
 			}
@@ -198,7 +212,7 @@ func Optimize(om *OutcomeMap, modelProbs []float64, budgetSats float64, cfg Conf
 		copy(newDelta, delta)
 		for _, c := range A {
 			i := c.idx
-			grad := -(1+cfg.Tau)*prices[i]*sumInvW + modelProbs[i]*(1-cfg.Tau)*100.0/W[i]
+			grad := -(1+cfg.Tau)*prices[i]*sumInvW + modelProbs[i]*100.0/W[i]
 			newDelta[i] = math.Max(0, math.Min(caps[i], newDelta[i]+step*grad))
 		}
 
@@ -247,13 +261,24 @@ func Optimize(om *OutcomeMap, modelProbs []float64, budgetSats float64, cfg Conf
 	return trades, nil
 }
 
-// ExpectedCost estimates the total trade cost in sats for a set of trades
-// Uses the linear approximation cost
-func ExpectedCost(trades []Trade) int64 {
-	total := int64(0)
-	for _, t := range trades {
-		// YesPriceMillisats / 1000 = price in sats
-		total += t.YesPriceMillisats * int64(t.Contracts) / 1000
+// ExpectedCost computes the exact LS-LMSR cost in sats to execute trades
+// against market state q: (1+tau) * (C(q + Σdelta) - C(q)). The LMSR cost
+// function is strictly convex, so buying multiple contracts on a bin moves
+// that bin's price as you buy — cost is not linear in contract count, and a
+// naive price×quantity sum understates the true (and actual exchange-
+// charged) cost for anything beyond a single contract.
+func ExpectedCost(q []float64, trades []Trade, tau float64) int64 {
+	if len(trades) == 0 {
+		return 0
 	}
-	return int64(float64(total) * (1 + lmsr.Tau))
+	qNew := make([]float64, len(q))
+	copy(qNew, q)
+	for _, t := range trades {
+		if t.BinIndex >= 0 && t.BinIndex < len(qNew) {
+			qNew[t.BinIndex] += float64(t.Contracts)
+		}
+	}
+	c0 := lmsr.CostFunction(q)
+	c1 := lmsr.CostFunction(qNew)
+	return int64((1 + tau) * (c1 - c0))
 }

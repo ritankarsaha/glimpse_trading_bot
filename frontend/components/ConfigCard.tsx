@@ -2,7 +2,7 @@
 
 import { useRef, useState } from 'react';
 import type { MarketSummary } from '@/lib/types';
-import { fetchMarkets, fetchQuotes, postToken, quickTrade, startBot, stopBot } from '@/lib/api';
+import { fetchMarkets, fetchQuotes, postAPIKey, quickTrade, startBot, stopBot } from '@/lib/api';
 import type { Outcome, QuickTradeResult } from '@/lib/types';
 
 interface Props {
@@ -25,6 +25,7 @@ const MODELS = [
   { value: 'skewed',    label: 'Skewed Gaussian', desc: 'Gaussian shifted by Fear & Greed index — contrarian (fear → bullish, greed → bearish).' },
   { value: 'lognormal', label: 'Log-Normal',      desc: 'log(P_T) ~ N(log(S)−σ²T/2, σ²T). Right-skewed, correct for asset prices. Uses annual vol + time-to-expiry automatically.' },
   { value: 'uniform',   label: 'Uniform',         desc: 'Equal probability across all 500 bins. Useful as a baseline / stress-test.' },
+  { value: 'benter',    label: 'Benter (Two-Stage Logit)', desc: "Blends a log-normal fundamental forecast with the market-implied probability via Benter's (1994) two-stage logit combination. Uses calibrated weights (β_F, β_M) from data/calibration.json if present — run `-calibrate` to fit them — else defaults to β_F=β_M=1." },
 ] as const;
 
 function fmtExpiry(endTimeUtc: number): string {
@@ -49,8 +50,8 @@ function Tooltip({ text }: { text: string }) {
 type Mode = 'strategy' | 'kelly';
 
 export default function ConfigCard({ running, onStart, onStop, onError, onClearError }: Props) {
-  const [token, setToken] = useState('');
-  const [tokenBorder, setTokenBorder] = useState('border-[#222222]');
+  const [apiKey, setApiKey] = useState('');
+  const [apiKeyBorder, setApiKeyBorder] = useState('border-[#222222]');
   const [markets, setMarkets] = useState<MarketSummary[]>([]);
   const [selectedMarket, setSelectedMarket] = useState('');
   const [marketHint, setMarketHint] = useState('');
@@ -69,6 +70,10 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
   const [annualVolPct, setAnnualVolPct] = useState(65);
   const [kellyFraction, setKellyFraction] = useState(0.25);
 
+  const [multiMarket, setMultiMarket] = useState(false);
+  const [themeCapPct, setThemeCapPct] = useState(25);
+  const [perMarketCapPct, setPerMarketCapPct] = useState(10);
+
   const [pollSec, setPollSec] = useState(60);
   const [maxTrades, setMaxTrades] = useState(5);
   const [dryRun, setDryRun] = useState(true);
@@ -81,17 +86,17 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
   const [quickDryRun, setQuickDryRun] = useState(false);
   const [quickBusy, setQuickBusy] = useState(false);
   const [quickResult, setQuickResult] = useState<(QuickTradeResult & { error?: string }) | null>(null);
-  const tokenTimer = useRef<ReturnType<typeof setTimeout>>();
+  const apiKeyTimer = useRef<ReturnType<typeof setTimeout>>();
 
-  const handleTokenChange = (val: string) => {
-    setToken(val);
-    if (!val) { setTokenBorder('border-[#222222]'); return; }
-    if (!val.startsWith('eyJ')) { setTokenBorder('border-[#ff4d4d]'); return; }
-    setTokenBorder('border-[#f7931a]');
-    clearTimeout(tokenTimer.current);
-    tokenTimer.current = setTimeout(async () => {
-      try { await postToken(val); onClearError(); }
-      catch (e: unknown) { onError('Token update failed: ' + (e instanceof Error ? e.message : e)); }
+  const handleAPIKeyChange = (val: string) => {
+    setApiKey(val);
+    if (!val) { setApiKeyBorder('border-[#222222]'); return; }
+    if (!val.startsWith('glp_')) { setApiKeyBorder('border-[#ff4d4d]'); return; }
+    setApiKeyBorder('border-[#f7931a]');
+    clearTimeout(apiKeyTimer.current);
+    apiKeyTimer.current = setTimeout(async () => {
+      try { await postAPIKey(val); onClearError(); }
+      catch (e: unknown) { onError('API key update failed: ' + (e instanceof Error ? e.message : e)); }
     }, 500);
   };
 
@@ -123,12 +128,13 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
 
   const handleStart = async () => {
     const topicID = parseInt(selectedMarket) || 0;
-    if (!topicID) {
+    const skipMarketCheck = mode === 'kelly' && multiMarket;
+    if (!topicID && !skipMarketCheck) {
       onError('Select a market first — click "Load ↻" to fetch active markets.');
       return;
     }
-    if (token && token.startsWith('eyJ')) {
-      try { await postToken(token); } catch { }
+    if (apiKey && apiKey.startsWith('glp_')) {
+      try { await postAPIKey(apiKey); } catch { }
     }
     try {
       if (mode === 'kelly') {
@@ -147,6 +153,9 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
           sigma_pct: sigmaPct,
           annual_vol_pct: annualVolPct,
           kelly_fraction: kellyFraction,
+          multi_market: multiMarket,
+          theme_cap_pct: themeCapPct,
+          per_market_cap_pct: perMarketCapPct,
         });
       } else {
         await startBot({
@@ -219,17 +228,18 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
     <div className="card p-5">
       <h2 className="section-title mb-4">Configuration</h2>
 
-      {/* JWT Token */}
+      {/* API Key */}
       <div className="mb-3.5">
-        <label className="field-label">JWT Token (paste from DevTools)</label>
+        <label className="field-label">API Key (optional — overrides the server-configured key)</label>
         <input
           type="password"
-          value={token}
-          onChange={(e) => handleTokenChange(e.target.value)}
-          placeholder="eyJ..."
+          value={apiKey}
+          onChange={(e) => handleAPIKeyChange(e.target.value)}
+          placeholder="glp_live_... (leave blank to use GLIMPSE_API_KEY)"
           autoComplete="off"
-          className={`w-full bg-[#0a0a0a] border ${tokenBorder} rounded text-[#e0e0e0] font-mono text-[13px] px-2.5 py-2 outline-none transition-colors`}
+          className={`w-full bg-[#0a0a0a] border ${apiKeyBorder} rounded text-[#e0e0e0] font-mono text-[13px] px-2.5 py-2 outline-none transition-colors`}
         />
+        <p className="text-[11px] mt-1 text-[#555]">The bot already trades using the API key configured on the server. Only paste one here to switch keys without restarting.</p>
       </div>
 
       {/* Market */}
@@ -369,6 +379,49 @@ export default function ConfigCard({ running, onStart, onStop, onError, onClearE
               {kellyFractionLabel()}
             </p>
           </div>
+
+          <div className="my-4 border-t border-[#1a1a1a]" />
+
+          <div className="mb-3.5">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={multiMarket} onChange={(e) => setMultiMarket(e.target.checked)} className="w-4 h-4 accent-[#00c48c] cursor-pointer" />
+              <span className="text-[13px]">
+                Multi-Market (Portfolio)
+                <Tooltip text="Trades every active Glimpse market each tick instead of just the selected one. Each market is sized independently with Kelly, then the Trader Education Part 3 rule applies: correlated BTC markets are treated as one theme and capped together." />
+              </span>
+            </label>
+            {multiMarket && (
+              <p className="text-[11px] text-[#00c48c]/60 mt-1 leading-relaxed">
+                Ignores the selected market above — scans all active markets every tick.
+              </p>
+            )}
+          </div>
+
+          {multiMarket && (
+            <>
+              <div className="mb-3.5">
+                <label className="field-label">
+                  Theme cap (% of budget)
+                  <Tooltip text="Maximum share of the Kelly budget allowed across all open markets combined. If the unconstrained sizes exceed this, every market's contracts are scaled down proportionally." />
+                </label>
+                <div className="flex items-center gap-2.5">
+                  <input type="range" min={5} max={100} step={5} value={themeCapPct} onChange={(e) => setThemeCapPct(Number(e.target.value))} className="flex-1 accent-[#00c48c]" />
+                  <span className="font-mono text-[13px] text-[#00c48c] min-w-[36px] text-right">{themeCapPct}%</span>
+                </div>
+              </div>
+
+              <div className="mb-3.5">
+                <label className="field-label">
+                  Per-market cap (% of budget)
+                  <Tooltip text="Maximum share of the Kelly budget allowed in any single market, applied after the theme cap." />
+                </label>
+                <div className="flex items-center gap-2.5">
+                  <input type="range" min={5} max={50} step={5} value={perMarketCapPct} onChange={(e) => setPerMarketCapPct(Number(e.target.value))} className="flex-1 accent-[#00c48c]" />
+                  <span className="font-mono text-[13px] text-[#00c48c] min-w-[36px] text-right">{perMarketCapPct}%</span>
+                </div>
+              </div>
+            </>
+          )}
 
           <div className="my-4 border-t border-[#1a1a1a]" />
         </>

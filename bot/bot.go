@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/ritankarsaha/glimpse-bot/api"
+	"github.com/ritankarsaha/glimpse-bot/backtest"
 	"github.com/ritankarsaha/glimpse-bot/kelly"
 	"github.com/ritankarsaha/glimpse-bot/lmsr"
 	"github.com/ritankarsaha/glimpse-bot/model"
+	"github.com/ritankarsaha/glimpse-bot/portfolio"
 	"github.com/ritankarsaha/glimpse-bot/strategy"
 )
 
@@ -33,6 +36,16 @@ type BotConfig struct {
 	AnnualVolPct  float64 // annualised vol in %; 0 falls back to SigmaPct
 	MinEdge       float64 // minimum edge threshold; 0 uses kelly.DefaultConfig value
 	MaxBins       int     // max bins per Kelly round; 0 uses kelly.DefaultConfig value
+
+	// Multi-market portfolio mode (activated when MultiMarket is true; implies Kelly)
+	MultiMarket     bool
+	ThemeCapPct     float64 // % of budget allowed across all open markets combined; 0 uses portfolio.DefaultConfig value
+	PerMarketCapPct float64 // % of budget allowed in any single market; 0 uses portfolio.DefaultConfig value
+
+	// Calibration / out-of-sample recording
+	RecordSamples   bool
+	SamplesPath     string
+	CalibrationFile string
 }
 
 type KellyTradeSummary struct {
@@ -95,8 +108,11 @@ type Bot struct {
 	tradedOptions map[int]bool
 	cancel        context.CancelFunc
 
-	forecaster model.Forecaster
-	kellyCfg   kelly.Config
+	forecaster   model.Forecaster
+	kellyCfg     kelly.Config
+	portfolioCfg portfolio.Config
+	recorder     *backtest.Recorder
+	reconciled   map[int]bool
 }
 
 func NewBot(client *api.GlimpseClient, strat strategy.Strategy, cfg BotConfig) *Bot {
@@ -105,6 +121,7 @@ func NewBot(client *api.GlimpseClient, strat strategy.Strategy, cfg BotConfig) *
 		strat:         strat,
 		cfg:           cfg,
 		tradedOptions: make(map[int]bool),
+		reconciled:    make(map[int]bool),
 	}
 }
 
@@ -114,11 +131,11 @@ func (b *Bot) Start() error {
 	if b.state.Running {
 		return fmt.Errorf("bot is already running")
 	}
-	if !b.client.HasToken() {
-		return fmt.Errorf("no JWT token configured — paste one via the UI first")
+	if !b.client.HasAPIKey() {
+		return fmt.Errorf("no API key configured — set GLIMPSE_API_KEY or paste one via the UI first")
 	}
 
-	if b.cfg.KellyFraction > 0 {
+	if b.cfg.KellyFraction > 0 || b.cfg.MultiMarket {
 		name := b.cfg.ModelURL // HTTP endpoint takes precedence
 		if name == "" {
 			name = b.cfg.ModelName
@@ -130,19 +147,36 @@ func (b *Bot) Start() error {
 		if sigma <= 0 {
 			sigma = 5.0
 		}
-		f, err := model.FromName(name, sigma)
+		f, err := model.FromNameWithCalibration(name, sigma, b.cfg.CalibrationFile)
 		if err != nil {
 			return fmt.Errorf("forecast model: %w", err)
 		}
 		b.forecaster = f
 		b.kellyCfg = kelly.DefaultConfig()
-		b.kellyCfg.KellyFraction = b.cfg.KellyFraction
+		if b.cfg.KellyFraction > 0 {
+			b.kellyCfg.KellyFraction = b.cfg.KellyFraction
+		}
 		if b.cfg.MinEdge > 0 {
 			b.kellyCfg.MinEdge = b.cfg.MinEdge
 		}
 		if b.cfg.MaxBins > 0 {
 			b.kellyCfg.MaxBins = b.cfg.MaxBins
 		}
+
+		b.portfolioCfg = portfolio.DefaultConfig()
+		b.portfolioCfg.KellyCfg = b.kellyCfg
+		if b.cfg.ThemeCapPct > 0 {
+			b.portfolioCfg.ThemeCapPct = b.cfg.ThemeCapPct / 100.0
+		}
+		if b.cfg.PerMarketCapPct > 0 {
+			b.portfolioCfg.PerMarketCapPct = b.cfg.PerMarketCapPct / 100.0
+		}
+	}
+
+	if b.cfg.RecordSamples && b.cfg.SamplesPath != "" {
+		b.recorder = backtest.NewRecorder(b.cfg.SamplesPath)
+	} else {
+		b.recorder = nil
 	}
 
 	b.state = BotState{
@@ -154,6 +188,7 @@ func (b *Bot) Start() error {
 	b.tradelog = nil
 	b.logs = nil
 	b.tradedOptions = make(map[int]bool)
+	b.reconciled = make(map[int]bool)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	b.cancel = cancel
@@ -222,7 +257,10 @@ func (b *Bot) run(ctx context.Context) {
 	}()
 
 	modeName := "strategy"
-	if b.cfg.KellyFraction > 0 {
+	if b.cfg.MultiMarket {
+		modeName = fmt.Sprintf("portfolio(model=%s c=%.2f theme=%.0f%% market=%.0f%%)",
+			b.cfg.ModelName, b.kellyCfg.KellyFraction, b.portfolioCfg.ThemeCapPct*100, b.portfolioCfg.PerMarketCapPct*100)
+	} else if b.cfg.KellyFraction > 0 {
 		modeName = fmt.Sprintf("kelly(model=%s c=%.2f)", b.cfg.ModelName, b.cfg.KellyFraction)
 	} else if b.strat != nil {
 		modeName = "strategy=" + b.strat.Name()
@@ -257,7 +295,7 @@ func (b *Bot) run(ctx context.Context) {
 
 func (b *Bot) tick(_ context.Context) {
 	if b.IsPaused() {
-		b.appendLog("Paused — waiting for fresh JWT token")
+		b.appendLog("Paused — waiting for a valid API key")
 		return
 	}
 
@@ -276,7 +314,7 @@ func (b *Bot) tick(_ context.Context) {
 	wallet, err := b.client.GetWalletBalance()
 	if err != nil {
 		if api.IsUnauthorized(err) {
-			b.setPaused("JWT expired — paste a fresh token in the UI")
+			b.setPaused("API key unauthorized — check the key is valid in the UI")
 			return
 		}
 		if api.IsTransient(err) {
@@ -294,10 +332,23 @@ func (b *Bot) tick(_ context.Context) {
 		return
 	}
 
+	b.mu.Lock()
+	b.state.LastSpot = spot
+	b.state.LastFng = fng
+	b.state.LastFngLabel = fngLabel
+	b.state.WalletBalance = wallet.Balance / 1000
+	b.state.LastError = ""
+	b.mu.Unlock()
+
+	if b.cfg.MultiMarket {
+		b.tickPortfolio(spot, fng, fngLabel, wallet)
+		return
+	}
+
 	market, err := b.client.GetQuotes(b.cfg.TopicID)
 	if err != nil {
 		if api.IsUnauthorized(err) {
-			b.setPaused("JWT expired — paste a fresh token in the UI")
+			b.setPaused("API key unauthorized — check the key is valid in the UI")
 			return
 		}
 		if api.IsTransient(err) {
@@ -310,6 +361,7 @@ func (b *Bot) tick(_ context.Context) {
 
 	if market.IsResolved {
 		b.appendLog(fmt.Sprintf("Market %d already resolved, skipping", b.cfg.TopicID))
+		b.reconcileResolved(b.cfg.TopicID, time.Unix(market.MarketEndTimeUTC, 0), spot)
 		return
 	}
 
@@ -326,19 +378,51 @@ func (b *Bot) tick(_ context.Context) {
 		}
 	}
 
-	b.mu.Lock()
-	b.state.LastSpot = spot
-	b.state.LastFng = fng
-	b.state.LastFngLabel = fngLabel
-	b.state.WalletBalance = wallet.Balance / 1000
-	b.state.LastError = ""
-	b.mu.Unlock()
-
 	if b.cfg.KellyFraction > 0 {
 		b.tickKelly(spot, fng, fngLabel, wallet, market, expiry)
 	} else {
 		b.tickStrategy(spot, fng, fngLabel, wallet, market, expiry)
 	}
+}
+
+// recordSample appends a forecast/market-probability sample for topicID to
+// the calibration log (no-op if recording is disabled). It records the
+// fundamental forecast (not a benter-blended one) so FitLogitWeights always
+// sees the underlying signal, per Benter's two-stage approach.
+func (b *Bot) recordSample(topicID int, fctx model.ForecastContext, om *kelly.OutcomeMap) {
+	if b.recorder == nil {
+		return
+	}
+	fp, err := model.FundamentalProbs(b.forecaster, fctx)
+	if err != nil {
+		b.appendLog(fmt.Sprintf("recording sample for topic %d: %v", topicID, err))
+		return
+	}
+	sample := backtest.Sample{
+		Timestamp:        time.Now(),
+		TopicID:          topicID,
+		FundamentalProbs: fp,
+		MarketProbs:      lmsr.ImpliedProbs(om.Q),
+		OutcomeBin:       -1,
+	}
+	if err := b.recorder.Record(sample); err != nil {
+		b.appendLog(fmt.Sprintf("recording sample for topic %d: %v", topicID, err))
+	}
+}
+
+// reconcileResolved fills in the realized outcome bin for any unresolved
+// recorded samples of topicID once the market has resolved, so the
+// calibration harness (backtest.FitLogitWeights) can use them. Each topic is
+// reconciled at most once per bot run.
+func (b *Bot) reconcileResolved(topicID int, expiry time.Time, spot float64) {
+	if b.recorder == nil || b.reconciled[topicID] {
+		return
+	}
+	if err := backtest.Reconcile(b.cfg.SamplesPath, topicID, expiry, lmsr.SpotToBin(spot)); err != nil {
+		b.appendLog(fmt.Sprintf("reconcile topic %d: %v", topicID, err))
+		return
+	}
+	b.reconciled[topicID] = true
 }
 
 func (b *Bot) tickKelly(spot float64, fng int, fngLabel string, wallet *api.WalletBalance, market *api.Market, expiry time.Time) {
@@ -359,6 +443,8 @@ func (b *Bot) tickKelly(spot float64, fng int, fngLabel string, wallet *api.Wall
 		b.setError(fmt.Sprintf("forecast: %v", err))
 		return
 	}
+
+	b.recordSample(b.cfg.TopicID, fctx, om)
 
 	balSats := float64(wallet.Balance) / 1000.0
 	budgetSats := balSats * float64(b.cfg.MaxWalletPct) / 100.0
@@ -404,7 +490,7 @@ func (b *Bot) tickKelly(spot float64, fng int, fngLabel string, wallet *api.Wall
 	})
 	if err != nil {
 		if api.IsUnauthorized(err) {
-			b.setPaused("JWT expired — paste a fresh token in the UI")
+			b.setPaused("API key unauthorized — check the key is valid in the UI")
 			return
 		}
 		if api.IsTransient(err) {
@@ -481,6 +567,205 @@ func (b *Bot) executeKellyDryRun(trades []kelly.Trade) {
 		Timestamp:     time.Now(),
 		DryRun:        true,
 		KellyLegs:     kellyLegs,
+	}
+	b.mu.Lock()
+	b.tradelog = append(b.tradelog, record)
+	b.state.SessionTrades++
+	b.state.TotalCostMillisats += totalMs
+	b.state.LastTradeTime = record.Timestamp
+	b.mu.Unlock()
+}
+func (b *Bot) tickPortfolio(spot float64, fng int, fngLabel string, wallet *api.WalletBalance) {
+	b.appendLog(fmt.Sprintf("portfolio tick: spot=$%.2f fng=%d(%s)", spot, fng, fngLabel))
+
+	summaries, err := b.client.GetActiveMarkets()
+	if err != nil {
+		if api.IsUnauthorized(err) {
+			b.setPaused("API key unauthorized — check the key is valid in the UI")
+			return
+		}
+		if api.IsTransient(err) {
+			b.appendLog(fmt.Sprintf("[TRANSIENT] active markets: %v — will retry next tick", err))
+			return
+		}
+		b.setError(fmt.Sprintf("fetching active markets: %v", err))
+		return
+	}
+
+	var inputs []portfolio.MarketInput
+	for _, ms := range summaries {
+		if ms.IsResolved {
+			b.reconcileResolved(ms.TopicID, time.Unix(ms.EndTimeUTC, 0), spot)
+			continue
+		}
+		if !ms.IsActive {
+			continue
+		}
+		expiry := time.Unix(ms.EndTimeUTC, 0)
+		if time.Now().After(expiry.Add(5 * time.Minute)) {
+			continue
+		}
+		if b.cfg.MinExpiryMins > 0 {
+			if until := time.Until(expiry); until < time.Duration(b.cfg.MinExpiryMins)*time.Minute {
+				continue
+			}
+		}
+
+		market, err := b.client.GetQuotes(ms.TopicID)
+		if err != nil {
+			b.appendLog(fmt.Sprintf("portfolio: quotes for topic %d: %v — skipping market", ms.TopicID, err))
+			continue
+		}
+
+		om := kelly.BuildOutcomeMap(market.Outcomes)
+		fctx := model.ForecastContext{
+			SpotPrice:      spot,
+			FearGreedIndex: fng,
+			TimeToExpiry:   time.Until(expiry),
+			ImpliedProbs:   lmsr.ImpliedProbs(om.Q),
+			RealizedVolAnn: b.cfg.AnnualVolPct / 100.0,
+		}
+		mdlProbs, err := b.forecaster.Forecast(fctx)
+		if err != nil {
+			b.appendLog(fmt.Sprintf("portfolio: forecast for topic %d: %v — skipping market", ms.TopicID, err))
+			continue
+		}
+
+		b.recordSample(ms.TopicID, fctx, om)
+		inputs = append(inputs, portfolio.MarketInput{TopicID: ms.TopicID, OutcomeMap: om, ModelProbs: mdlProbs})
+	}
+
+	if len(inputs) == 0 {
+		b.appendLog("Portfolio: no eligible markets")
+		b.mu.Lock()
+		b.state.MispriceCount = 0
+		b.state.KellyTrades = nil
+		b.mu.Unlock()
+		return
+	}
+
+	balSats := float64(wallet.Balance) / 1000.0
+	budgetSats := balSats * float64(b.cfg.MaxWalletPct) / 100.0
+
+	allocations, err := portfolio.Allocate(inputs, budgetSats, b.portfolioCfg)
+	if err != nil {
+		b.setError(fmt.Sprintf("portfolio allocate: %v", err))
+		return
+	}
+
+	if len(allocations) == 0 {
+		b.appendLog("Portfolio: no underpriced bins found across active markets — skipping")
+		b.mu.Lock()
+		b.state.MispriceCount = 0
+		b.state.KellyTrades = nil
+		b.mu.Unlock()
+		return
+	}
+
+	// Iterate topics in a deterministic order (map iteration order is random).
+	topicIDs := make([]int, 0, len(allocations))
+	for topicID := range allocations {
+		topicIDs = append(topicIDs, topicID)
+	}
+	sort.Ints(topicIDs)
+
+	var summariesOut []KellyTradeSummary
+	var totalLegs int
+	topics := make([]api.TopicTrade, 0, len(topicIDs))
+	for _, topicID := range topicIDs {
+		trades := allocations[topicID]
+		legs := make([]api.Leg, 0, len(trades))
+		for _, t := range trades {
+			legs = append(legs, api.Leg{OptionID: t.OptionID, Contracts: t.Contracts})
+			summariesOut = append(summariesOut, KellyTradeSummary{
+				BinIndex:  t.BinIndex,
+				Range:     fmt.Sprintf("topic %d: %s", topicID, t.Range),
+				MarketPct: t.MarketProb * 100,
+				ModelPct:  t.ModelProb * 100,
+				EdgePct:   t.Edge * 100,
+				Contracts: t.Contracts,
+			})
+			totalLegs++
+		}
+		topics = append(topics, api.TopicTrade{TopicID: topicID, Legs: legs})
+	}
+
+	b.mu.Lock()
+	b.state.MispriceCount = totalLegs
+	b.state.KellyTrades = summariesOut
+	b.mu.Unlock()
+
+	b.appendLog(fmt.Sprintf("Portfolio: %d markets, %d legs, budget=%.0fsats (theme cap=%.0f%% market cap=%.0f%%)",
+		len(topics), totalLegs, budgetSats, b.portfolioCfg.ThemeCapPct*100, b.portfolioCfg.PerMarketCapPct*100))
+
+	if b.cfg.DryRun {
+		b.executePortfolioDryRun(allocations, topicIDs)
+		return
+	}
+
+	resp, err := b.client.PlaceTrade(api.TradeRequest{Topics: topics})
+	if err != nil {
+		if api.IsUnauthorized(err) {
+			b.setPaused("API key unauthorized — check the key is valid in the UI")
+			return
+		}
+		if api.IsTransient(err) {
+			b.appendLog(fmt.Sprintf("[TRANSIENT] place portfolio trade: %v — will retry next tick", err))
+			return
+		}
+		b.setError(fmt.Sprintf("placing portfolio trade: %v", err))
+		return
+	}
+	if resp.TopicsFailed > 0 {
+		b.setError(fmt.Sprintf("portfolio trade rejected (topics_failed=%d)", resp.TopicsFailed))
+		log.Printf("[BOT] portfolio trade rejected: %+v", resp)
+		return
+	}
+
+	var costMs, commMs int64
+	var tradeID string
+	for _, r := range resp.Results {
+		costMs += r.TotalCostMillisats
+		commMs += r.CommissionMillisats
+		tradeID = r.TradeID
+	}
+
+	record := TradeRecord{
+		TradeID:             tradeID,
+		Range:               fmt.Sprintf("PORTFOLIO(%d markets, %d legs)", len(topics), totalLegs),
+		CostMillisats:       costMs,
+		CommissionMillisats: commMs,
+		Timestamp:           time.Now(),
+	}
+	b.mu.Lock()
+	b.tradelog = append(b.tradelog, record)
+	b.state.SessionTrades++
+	b.state.TotalCostMillisats += costMs + commMs
+	b.state.LastTradeTime = record.Timestamp
+	b.mu.Unlock()
+
+	b.appendLog(fmt.Sprintf("Portfolio trade placed: id=%s markets=%d legs=%d cost=%dsats comm=%dsats",
+		tradeID, len(topics), totalLegs, costMs/1000, commMs/1000))
+}
+
+func (b *Bot) executePortfolioDryRun(allocations map[int][]kelly.Trade, topicIDs []int) {
+	var totalMs int64
+	var totalLegs int
+	for _, topicID := range topicIDs {
+		for _, t := range allocations[topicID] {
+			ms := t.YesPriceMillisats * int64(t.Contracts)
+			totalMs += ms
+			totalLegs++
+			b.appendLog(fmt.Sprintf("[DRY PORTFOLIO] topic=%d range=%s contracts=%d edge=%.2f%% cost=%dsats",
+				topicID, t.Range, t.Contracts, t.Edge*100, ms/1000))
+		}
+	}
+	record := TradeRecord{
+		TradeID:       fmt.Sprintf("dry-portfolio-%d", time.Now().UnixNano()),
+		Range:         fmt.Sprintf("PORTFOLIO(%d markets, %d legs)", len(topicIDs), totalLegs),
+		CostMillisats: totalMs,
+		Timestamp:     time.Now(),
+		DryRun:        true,
 	}
 	b.mu.Lock()
 	b.tradelog = append(b.tradelog, record)
@@ -572,7 +857,7 @@ func (b *Bot) tickStrategy(spot float64, fng int, fngLabel string, wallet *api.W
 	resp, err := b.client.PlaceTrade(tradeReq)
 	if err != nil {
 		if api.IsUnauthorized(err) {
-			b.setPaused("JWT expired — paste a fresh token in the UI")
+			b.setPaused("API key unauthorized — check the key is valid in the UI")
 			return
 		}
 		if api.IsTransient(err) {

@@ -42,8 +42,8 @@ go run . -tui
 
 - Go 1.21 or later (`go version`)
 - Node.js 18 or later + npm (`node -v`)
-- A Glimpse account with a funded Lightning wallet
-- A valid Glimpse JWT (see below)
+- A Glimpse account with a funded Lightning wallet, KYC completed
+- A Glimpse API key from the [Settings page](https://www.glimpse.markets) (see below) — API keys authenticate every request directly, no JWT sign-in needed
 
 ---
 
@@ -53,15 +53,15 @@ Settings can be provided three ways (highest priority wins):
 
 | Source | How |
 |--------|-----|
-| Environment variables | `export GLIMPSE_TOKEN=eyJ…` |
+| Environment variables | `export GLIMPSE_API_KEY=glp_live_…` |
 | `config.json` in working directory | see example below |
-| UI at runtime | paste token, adjust sliders, click Start |
+| UI at runtime | paste an API key to override, adjust sliders, click Start |
 
 ### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GLIMPSE_TOKEN` | _(empty)_ | JWT auth token |
+| `GLIMPSE_API_KEY` | _(empty)_ | Glimpse API key (from Settings → API Keys). Sent as-is in the `Authorization` header — no JWT sign-in required. |
 | `GLIMPSE_TOPIC_ID` | `1116` | Market topic to trade |
 | `GLIMPSE_CONTRACTS` | `1` | Contracts per trade leg (strategy mode) |
 | `GLIMPSE_STRATEGY` | `nearest` | `nearest` / `feargreed` / `bestodds` / `followcrowd` |
@@ -202,7 +202,7 @@ Key bindings: `q` quit · `s` start/stop · `d` toggle dry-run · `r` force refr
 | `GET` | `/api/quotes?topic_id=N` | Live outcome quotes for a given market |
 | `POST` | `/api/start` | Start the bot with config JSON body (strategy or Kelly mode) |
 | `POST` | `/api/stop` | Stop the bot |
-| `POST` | `/api/token` | Update JWT: `{"token": "eyJ…"}` |
+| `POST` | `/api/apikey` | Override the API key at runtime: `{"api_key": "glp_live_…"}` |
 | `POST` | `/api/quicktrade` | Place a single one-off trade on a specific option, outside of a session |
 | `GET` | `/api/wallet` | Live wallet balance from Glimpse |
 | `GET` | `/api/spot` | Live BTC/USD spot price from Coinbase |

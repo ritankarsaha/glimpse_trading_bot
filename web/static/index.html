@@ -51,7 +51,7 @@
       <tr><td>GET</td><td><code>/api/quotes?topic_id=N</code></td><td>Market outcomes + prices</td></tr>
       <tr><td>POST</td><td><code>/api/start</code></td><td>Start bot session (see payload below)</td></tr>
       <tr><td>POST</td><td><code>/api/stop</code></td><td>Stop running bot</td></tr>
-      <tr><td>POST</td><td><code>/api/token</code></td><td>Set JWT token</td></tr>
+      <tr><td>POST</td><td><code>/api/apikey</code></td><td>Set/override the Glimpse API key</td></tr>
       <tr><td>POST</td><td><code>/api/quicktrade</code></td><td>Single immediate trade</td></tr>
     </table>
   </div>
@@ -86,10 +86,11 @@
     <pre># 1. Check server is up
 curl http://localhost:3002/api/ping
 
-# 2. Set your JWT token
-curl -X POST http://localhost:3002/api/token \
+# 2. (Optional) override the API key — the server already loads one from
+#    GLIMPSE_API_KEY / config.json at startup, so this is only needed to switch keys live
+curl -X POST http://localhost:3002/api/apikey \
   -H 'Content-Type: application/json' \
-  -d '{"token":"YOUR_JWT_HERE"}'
+  -d '{"api_key":"glp_live_YOUR_KEY_HERE"}'
 
 # 3. Start Kelly bot with log-normal model (dry run)
 curl -X POST http://localhost:3002/api/start \

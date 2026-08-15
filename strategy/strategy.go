@@ -103,6 +103,8 @@ func (s *FearAndGreedStrategy) SelectOption(outcomes []api.Outcome, spotPrice fl
 	return findNearest(outcomes, adjusted)
 }
 
+const bestOddsMinYesPriceMillisats = 8000
+
 type BestOdds struct{}
 
 func (s *BestOdds) Name() string { return "bestodds" }
@@ -122,8 +124,8 @@ func (s *BestOdds) SelectOption(outcomes []api.Outcome, spotPrice float64, fng i
 	// Among those, pick lowest yes_price (best return) with implied prob >= 8%
 	var best *api.Outcome
 	for _, r := range window {
-		if r.Outcome.YesPriceMillisats < 80 {
-			continue 
+		if r.Outcome.YesPriceMillisats < bestOddsMinYesPriceMillisats {
+			continue
 		}
 		if best == nil || r.Outcome.YesPriceMillisats < best.YesPriceMillisats {
 			best = r.Outcome

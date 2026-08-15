@@ -127,21 +127,39 @@ func ImpliedProbs(q []float64) []float64 {
 	return out
 }
 
-// TruthfulCap finds Δᵢᵐᵃˣ such that pᵢ(q + Δ·eᵢ) = 100·targetProb via
-// binary search (pᵢ is strictly increasing in Δ since C is strictly convex)
+// TruthfulCap finds Δᵢᵐᵃˣ such that the *normalized* probability
+// Pᵢ(q + Δ·eᵢ) = pᵢ(q+Δ·eᵢ) / Σₖpₖ(q+Δ·eᵢ) equals targetProb, via binary
+// search (Pᵢ is strictly increasing in Δ since C is strictly convex).
+//
+// Per Glimpse's own LS-LMSR spec, the raw price components pᵢ do NOT sum to
+// 100 (they sum to something that drifts with market state, e.g. 100·(V+1)
+// at the uniform seed) — the platform's own formula for turning prices into
+// a probability distribution is Pᵢ(q) = pᵢ(q)/Σₖpₖ(q). targetProb (a model's
+// believed probability, summing to 1 across bins) must be compared against
+// that normalized quantity, not against the raw price on a flat 0-100 scale.
 func TruthfulCap(q []float64, idx int, targetProb float64) float64 {
-	target := 100.0 * targetProb
-	if PriceAtUpdate(q, idx, 0) >= target {
+	normProb := func(delta float64) float64 {
+		qNew := make([]float64, len(q))
+		copy(qNew, q)
+		qNew[idx] += delta
+		prices := PriceVector(qNew)
+		sum := 0.0
+		for _, p := range prices {
+			sum += p
+		}
+		return prices[idx] / sum
+	}
+	if normProb(0) >= targetProb {
 		return 0
 	}
 	hi := 200.0
-	for PriceAtUpdate(q, idx, hi) < target && hi < 1e10 {
+	for normProb(hi) < targetProb && hi < 1e10 {
 		hi *= 4
 	}
 	lo := 0.0
 	for i := 0; i < 64; i++ {
 		mid := (lo + hi) / 2
-		if PriceAtUpdate(q, idx, mid) < target {
+		if normProb(mid) < targetProb {
 			lo = mid
 		} else {
 			hi = mid

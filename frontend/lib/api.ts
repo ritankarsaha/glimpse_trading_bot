@@ -10,12 +10,12 @@ async function handleResponse(r: Response) {
   return r.json();
 }
 
-export async function postToken(token: string): Promise<void> {
+export async function postAPIKey(apiKey: string): Promise<void> {
   await handleResponse(
-    await fetch(`${BASE}/token`, {
+    await fetch(`${BASE}/apikey`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify({ api_key: apiKey }),
     })
   );
 }

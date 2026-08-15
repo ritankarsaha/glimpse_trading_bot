@@ -8,7 +8,7 @@ import (
 )
 
 type Config struct {
-	Token         string `json:"token"`
+	APIKey        string `json:"api_key"`
 	TopicID       int    `json:"topic_id"`
 	Contracts     int    `json:"contracts"`
 	Strategy      string `json:"strategy"`
@@ -21,12 +21,20 @@ type Config struct {
 	NoDuplicates  bool   `json:"no_duplicates"`
 
 	// Model / Kelly parameters
-	ModelName     string  `json:"model"`          // gaussian | skewed | uniform | lognormal | <url> | <path>
+	ModelName     string  `json:"model"`          // gaussian | skewed | uniform | lognormal | benter[:inner] | <url> | <path>
 	AnnualVolPct  float64 `json:"annual_vol_pct"` // annualised BTC vol in %; e.g. 65.0
 	KellyFraction float64 `json:"kelly_fraction"` // fractional Kelly, e.g. 0.25
 	MinEdge       float64 `json:"min_edge"`       // minimum edge to trade, e.g. 0.005
 	MaxBins       int     `json:"max_bins"`       // max bins per Kelly round
 	ModelURL      string  `json:"model_url"`      // HTTP forecaster endpoint (overrides model name)
+
+	// Multi-market portfolio + calibration parameters
+	MultiMarket     bool    `json:"multi_market"`      // trade all active markets as one correlated theme
+	ThemeCapPct     float64 `json:"theme_cap_pct"`     // max %% of budget across all markets combined
+	PerMarketCapPct float64 `json:"per_market_cap_pct"` // max %% of budget in any single market
+	RecordSamples   bool    `json:"record_samples"`    // record forecast/market probs for calibration
+	SamplesPath     string  `json:"samples_path"`      // JSONL path for recorded samples
+	CalibrationFile string  `json:"calibration_file"`  // betaF/betaM weights for the "benter" model
 }
 
 func Load() (*Config, error) {
@@ -46,6 +54,13 @@ func Load() (*Config, error) {
 		KellyFraction: 0.25,
 		MinEdge:       0.005,
 		MaxBins:       10,
+
+		MultiMarket:     false,
+		ThemeCapPct:     25,
+		PerMarketCapPct: 10,
+		RecordSamples:   true,
+		SamplesPath:     "data/forecasts.jsonl",
+		CalibrationFile: "data/calibration.json",
 	}
 
 	if data, err := os.ReadFile("config.json"); err == nil {
@@ -54,8 +69,8 @@ func Load() (*Config, error) {
 		}
 	}
 
-	if v := os.Getenv("GLIMPSE_TOKEN"); v != "" {
-		cfg.Token = v
+	if v := os.Getenv("GLIMPSE_API_KEY"); v != "" {
+		cfg.APIKey = v
 	}
 	if v := os.Getenv("GLIMPSE_TOPIC_ID"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -126,6 +141,28 @@ func Load() (*Config, error) {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.MaxBins = n
 		}
+	}
+	if v := os.Getenv("GLIMPSE_MULTI_MARKET"); v != "" {
+		cfg.MultiMarket = v == "true"
+	}
+	if v := os.Getenv("GLIMPSE_THEME_CAP_PCT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.ThemeCapPct = f
+		}
+	}
+	if v := os.Getenv("GLIMPSE_PER_MARKET_CAP_PCT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.PerMarketCapPct = f
+		}
+	}
+	if v := os.Getenv("GLIMPSE_RECORD_SAMPLES"); v != "" {
+		cfg.RecordSamples = v == "true"
+	}
+	if v := os.Getenv("GLIMPSE_SAMPLES_PATH"); v != "" {
+		cfg.SamplesPath = v
+	}
+	if v := os.Getenv("GLIMPSE_CALIBRATION_FILE"); v != "" {
+		cfg.CalibrationFile = v
 	}
 
 	return cfg, nil

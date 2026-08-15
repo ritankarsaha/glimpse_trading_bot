@@ -66,17 +66,38 @@ func TestPriceAtUpdateMonotone(t *testing.T) {
 
 func TestTruthfulCapRoundTrip(t *testing.T) {
 	q := uniformQ()
-	targetProb := 0.05 // 5%, well above the market-implied 0.006 at uniform state
+	targetProb := 0.05 // 5%, well above the market-implied 0.002 (1/N) at uniform state
 	cap := TruthfulCap(q, 250, targetProb)
 	if cap <= 0 {
 		t.Fatalf("TruthfulCap returned %.4f; expected positive value", cap)
 	}
-	// Verify price at cap ≈ 100·targetProb
-	gotPrice := PriceAtUpdate(q, 250, cap)
-	wantPrice := 100.0 * targetProb
-	// Tolerance binary search stops at 0.5-contract precision -> ≤ 0.2% price error.
-	if math.Abs(gotPrice-wantPrice)/wantPrice > 0.003 {
-		t.Errorf("price after cap = %.6f, want %.6f (err %.2e)", gotPrice, wantPrice, math.Abs(gotPrice-wantPrice)/wantPrice)
+	// Verify the *normalized* probability at cap ≈ targetProb.
+	qNew := make([]float64, len(q))
+	copy(qNew, q)
+	qNew[250] += cap
+	prices := PriceVector(qNew)
+	sum := 0.0
+	for _, p := range prices {
+		sum += p
+	}
+	gotProb := prices[250] / sum
+	// Tolerance binary search stops at 0.5-contract precision -> ≤ 0.2% error.
+	if math.Abs(gotProb-targetProb)/targetProb > 0.003 {
+		t.Errorf("normalized prob after cap = %.6f, want %.6f (err %.2e)", gotProb, targetProb, math.Abs(gotProb-targetProb)/targetProb)
+	}
+}
+
+func TestTruthfulCapZeroWhenAlreadyAboveTarget(t *testing.T) {
+
+	q := uniformQ()
+	cap := TruthfulCap(q, 300, 1.0/float64(N))
+	if cap != 0 {
+		t.Errorf("TruthfulCap at fair-value target = %.4f, want 0", cap)
+	}
+	// A genuinely higher belief should still yield a positive, usable cap.
+	cap = TruthfulCap(q, 300, 5.0/float64(N))
+	if cap <= 0 {
+		t.Errorf("TruthfulCap for a 5x-fair belief = %.4f, want > 0", cap)
 	}
 }
 
