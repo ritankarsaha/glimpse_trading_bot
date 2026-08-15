@@ -299,6 +299,52 @@ func (m *EnsembleForecaster) Forecast(ctx ForecastContext) ([]float64, error) {
 
 // FromName constructs a Forecaster by name or JSON file path
 func FromName(name string, sigmaPct float64) (Forecaster, error) {
+	return FromNameWithCalibration(name, sigmaPct, "")
+}
+
+// CalibrationWeights holds the Benter two-stage logit weights fitted by
+// backtest.FitLogitWeights and persisted to a JSON file.
+type CalibrationWeights struct {
+	BetaFundamental float64 `json:"beta_fundamental"`
+	BetaMarket      float64 `json:"beta_market"`
+}
+
+// loadCalibrationWeights reads {betaF, betaM} from path. If path is empty or
+// the file doesn't exist/parse, it returns the default geometric-mean prior
+// (1.0, 1.0) — "shrink toward market" before any calibration data exists.
+func loadCalibrationWeights(path string) CalibrationWeights {
+	w := CalibrationWeights{BetaFundamental: 1.0, BetaMarket: 1.0}
+	if path == "" {
+		return w
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return w
+	}
+	if err := json.Unmarshal(data, &w); err != nil {
+		return CalibrationWeights{BetaFundamental: 1.0, BetaMarket: 1.0}
+	}
+	return w
+}
+
+// FromNameWithCalibration constructs a Forecaster by name or JSON file path.
+// "benter" and "benter:<inner>" wrap <inner> (default "lognormal") in a
+// LogitCombinerModel, loading calibrated {betaF, betaM} from calibrationPath
+// if present (see CalibrationWeights).
+func FromNameWithCalibration(name string, sigmaPct float64, calibrationPath string) (Forecaster, error) {
+	if name == "benter" || strings.HasPrefix(name, "benter:") {
+		inner := "lognormal"
+		if idx := strings.Index(name, ":"); idx >= 0 && idx+1 < len(name) {
+			inner = name[idx+1:]
+		}
+		fundamental, err := FromNameWithCalibration(inner, sigmaPct, calibrationPath)
+		if err != nil {
+			return nil, fmt.Errorf("benter: inner model %q: %w", inner, err)
+		}
+		weights := loadCalibrationWeights(calibrationPath)
+		return NewLogitCombinerModel(fundamental, weights.BetaFundamental, weights.BetaMarket), nil
+	}
+
 	switch name {
 	case "gaussian":
 		return NewGaussianModel(sigmaPct), nil
@@ -315,7 +361,7 @@ func FromName(name string, sigmaPct float64) (Forecaster, error) {
 		if _, err := os.Stat(name); err == nil {
 			return &JSONFileModel{Path: name}, nil
 		}
-		return nil, fmt.Errorf("unknown model %q: choose gaussian, skewed, uniform, lognormal, an HTTP(S) URL, or a JSON file path", name)
+		return nil, fmt.Errorf("unknown model %q: choose gaussian, skewed, uniform, lognormal, benter[:inner], an HTTP(S) URL, or a JSON file path", name)
 	}
 }
 

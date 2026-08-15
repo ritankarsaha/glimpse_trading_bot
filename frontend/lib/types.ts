@@ -82,6 +82,10 @@ export interface StartPayload {
   kelly_fraction?: number;
   min_edge?: number;
   max_bins?: number;
+  // Multi-market portfolio mode
+  multi_market?: boolean;
+  theme_cap_pct?: number;
+  per_market_cap_pct?: number;
 }
 
 export interface QuickTradePayload {

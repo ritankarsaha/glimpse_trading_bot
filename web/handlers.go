@@ -41,7 +41,7 @@ func NewHandler(mux *http.ServeMux, client *api.GlimpseClient, cfg *config.Confi
 	mux.HandleFunc("/api/trades", h.cors(h.handleTrades))
 	mux.HandleFunc("/api/start", h.cors(h.handleStart))
 	mux.HandleFunc("/api/stop", h.cors(h.handleStop))
-	mux.HandleFunc("/api/token", h.cors(h.handleToken))
+	mux.HandleFunc("/api/apikey", h.cors(h.handleAPIKey))
 	mux.HandleFunc("/api/wallet", h.cors(h.handleWallet))
 	mux.HandleFunc("/api/spot", h.cors(h.handleSpot))
 	mux.HandleFunc("/api/markets", h.cors(h.handleMarkets))
@@ -134,6 +134,10 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		AnnualVolPct  float64 `json:"annual_vol_pct"`
 		MinEdge       float64 `json:"min_edge"`
 		MaxBins       int     `json:"max_bins"`
+		// Multi-market portfolio mode — trades all active markets as one theme
+		MultiMarket     bool    `json:"multi_market"`
+		ThemeCapPct     float64 `json:"theme_cap_pct"`
+		PerMarketCapPct float64 `json:"per_market_cap_pct"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		errJSON(w, fmt.Sprintf("invalid body: %v", err), http.StatusBadRequest)
@@ -171,6 +175,12 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.MaxBins == 0 {
 		req.MaxBins = h.cfg.MaxBins
+	}
+	if req.ThemeCapPct == 0 {
+		req.ThemeCapPct = h.cfg.ThemeCapPct
+	}
+	if req.PerMarketCapPct == 0 {
+		req.PerMarketCapPct = h.cfg.PerMarketCapPct
 	}
 
 	// Decide mode: Kelly when "model" is provided, otherwise strategy
@@ -210,6 +220,13 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 		AnnualVolPct:   req.AnnualVolPct,
 		MinEdge:        req.MinEdge,
 		MaxBins:        req.MaxBins,
+
+		MultiMarket:     req.MultiMarket,
+		ThemeCapPct:     req.ThemeCapPct,
+		PerMarketCapPct: req.PerMarketCapPct,
+		RecordSamples:   h.cfg.RecordSamples,
+		SamplesPath:     h.cfg.SamplesPath,
+		CalibrationFile: h.cfg.CalibrationFile,
 	}
 
 	h.mu.Lock()
@@ -249,26 +266,26 @@ func (h *Handler) handleStop(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "stopped"})
 }
 
-// POST /api/token
-func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
+// POST /api/apikey
+func (h *Handler) handleAPIKey(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errJSON(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var req struct {
-		Token string `json:"token"`
+		APIKey string `json:"api_key"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		errJSON(w, fmt.Sprintf("invalid body: %v", err), http.StatusBadRequest)
 		return
 	}
-	if req.Token == "" {
-		errJSON(w, "token must not be empty", http.StatusBadRequest)
+	if req.APIKey == "" {
+		errJSON(w, "api_key must not be empty", http.StatusBadRequest)
 		return
 	}
 
-	h.client.SetToken(req.Token)
+	h.client.SetAPIKey(req.APIKey)
 	h.mu.Lock()
 	b := h.bot
 	h.mu.Unlock()
@@ -276,7 +293,7 @@ func (h *Handler) handleToken(w http.ResponseWriter, r *http.Request) {
 		b.Resume()
 	}
 
-	writeJSON(w, map[string]string{"status": "token updated"})
+	writeJSON(w, map[string]string{"status": "api key updated"})
 }
 
 // GET /api/wallet
@@ -308,7 +325,7 @@ func (h *Handler) handleQuotes(w http.ResponseWriter, r *http.Request) {
 	market, err := h.client.GetQuotes(topicID)
 	if err != nil {
 		if api.IsUnauthorized(err) {
-			errJSON(w, "JWT expired — paste a fresh token first", http.StatusUnauthorized)
+			errJSON(w, "unauthorized — check your Glimpse API key is valid and active", http.StatusUnauthorized)
 			return
 		}
 		errJSON(w, fmt.Sprintf("fetching quotes: %v", err), http.StatusBadGateway)
@@ -350,7 +367,7 @@ func (h *Handler) handleQuickTrade(w http.ResponseWriter, r *http.Request) {
 	market, err := h.client.GetQuotes(req.TopicID)
 	if err != nil {
 		if api.IsUnauthorized(err) {
-			errJSON(w, "JWT expired — paste a fresh token first", http.StatusUnauthorized)
+			errJSON(w, "unauthorized — check your Glimpse API key is valid and active", http.StatusUnauthorized)
 			return
 		}
 		errJSON(w, fmt.Sprintf("fetching quotes: %v", err), http.StatusBadGateway)
@@ -404,7 +421,7 @@ func (h *Handler) handleQuickTrade(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.client.PlaceTrade(tradeReq)
 	if err != nil {
 		if api.IsUnauthorized(err) {
-			errJSON(w, "JWT expired — paste a fresh token first", http.StatusUnauthorized)
+			errJSON(w, "unauthorized — check your Glimpse API key is valid and active", http.StatusUnauthorized)
 			return
 		}
 		errJSON(w, fmt.Sprintf("placing trade: %v", err), http.StatusBadGateway)

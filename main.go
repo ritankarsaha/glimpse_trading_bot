@@ -2,16 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/ritankarsaha/glimpse-bot/api"
+	"github.com/ritankarsaha/glimpse-bot/backtest"
 	"github.com/ritankarsaha/glimpse-bot/config"
 	"github.com/ritankarsaha/glimpse-bot/kelly"
 	"github.com/ritankarsaha/glimpse-bot/model"
@@ -27,6 +30,7 @@ func main() {
 	tuiSigma := flag.Float64("sigma", 5.0, "Gaussian σ as %% of spot price (used by gaussian/skewed models)")
 	tuiKelly := flag.Float64("kelly", 0.0, "Kelly fraction c (0 < c ≤ 1; 0.25 = quarter-Kelly; 0 = use config default)")
 	tuiAnnualVol := flag.Float64("annual-vol", 0.0, "BTC annualised vol in %% (e.g. 65.0 for 65%%; 0 = use config default)")
+	calibrate := flag.String("calibrate", "", "path to recorded forecast samples (JSONL); fits Benter calibration weights, writes the config calibration file, prints a report, and exits")
 	flag.Parse()
 
 	cfg, err := config.Load()
@@ -34,7 +38,12 @@ func main() {
 		log.Fatalf("[main] config error: %v", err)
 	}
 
-	client := api.NewGlimpseClient(cfg.Token)
+	if *calibrate != "" {
+		runCalibration(*calibrate, cfg)
+		return
+	}
+
+	client := api.NewGlimpseClient(cfg.APIKey)
 
 	if *tuiMode {
 		modelName := *tuiModel
@@ -57,8 +66,8 @@ func main() {
 	if cfg.DryRun {
 		log.Println("[main] DRY RUN mode is ON — no real trades will be placed")
 	}
-	if cfg.Token == "" {
-		log.Println("[main] No JWT token configured — paste one in the UI before starting the bot")
+	if cfg.APIKey == "" {
+		log.Println("[main] No API key configured — set GLIMPSE_API_KEY, add \"api_key\" to config.json, or paste one in the UI before starting the bot")
 	}
 
 	mux := http.NewServeMux()
@@ -94,12 +103,12 @@ func main() {
 }
 
 func runTUI(client *api.GlimpseClient, cfg *config.Config, modelName string, sigma, kellyFrac, annualVol float64) {
-	if cfg.Token == "" {
-		fmt.Fprintln(os.Stderr, "No JWT token configured. Set GLIMPSE_TOKEN or add token to config.json.")
+	if cfg.APIKey == "" {
+		fmt.Fprintln(os.Stderr, "No API key configured. Set GLIMPSE_API_KEY or add \"api_key\" to config.json.")
 		os.Exit(1)
 	}
 
-	forecaster, err := model.FromName(modelName, sigma)
+	forecaster, err := model.FromNameWithCalibration(modelName, sigma, cfg.CalibrationFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "model error: %v\n", err)
 		os.Exit(1)
@@ -126,4 +135,45 @@ func runTUI(client *api.GlimpseClient, cfg *config.Config, modelName string, sig
 		fmt.Fprintf(os.Stderr, "tui error: %v\n", err)
 		os.Exit(1)
 	}
+}
+func runCalibration(samplesPath string, cfg *config.Config) {
+	samples, err := backtest.LoadSamples(samplesPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "loading samples from %s: %v\n", samplesPath, err)
+		os.Exit(1)
+	}
+
+	report, err := backtest.FitLogitWeights(samples, 0.2)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fitting calibration weights: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Samples:        %d (train=%d, holdout=%d)\n", report.NSamples, report.NTrain, report.NHoldout)
+	fmt.Printf("R2 (market):    %.4f\n", report.R2Market)
+	fmt.Printf("R2 (combined):  %.4f\n", report.R2Combined)
+	fmt.Printf("Delta R2:       %.4f\n", report.DeltaR2)
+	fmt.Printf("Fitted weights: betaF=%.2f betaM=%.2f\n", report.BetaFundamental, report.BetaMarket)
+
+	path := cfg.CalibrationFile
+	if path == "" {
+		path = "data/calibration.json"
+	}
+	weights := model.CalibrationWeights{BetaFundamental: report.BetaFundamental, BetaMarket: report.BetaMarket}
+	data, err := json.MarshalIndent(weights, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "encoding calibration weights: %v\n", err)
+		os.Exit(1)
+	}
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "creating %s: %v\n", dir, err)
+			os.Exit(1)
+		}
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "writing %s: %v\n", path, err)
+		os.Exit(1)
+	}
+	fmt.Printf("Wrote calibration weights to %s\n", path)
 }

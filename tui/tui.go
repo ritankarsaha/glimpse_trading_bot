@@ -225,7 +225,7 @@ func (t *TUI) tick() {
 	wallet, err := t.client.GetWalletBalance()
 	if err != nil {
 		if api.IsUnauthorized(err) {
-			t.setErr("JWT expired — paste a fresh token via /api/token")
+			t.setErr("API key unauthorized — check GLIMPSE_API_KEY or POST /api/apikey")
 		} else {
 			t.setErr("wallet: " + err.Error())
 		}
